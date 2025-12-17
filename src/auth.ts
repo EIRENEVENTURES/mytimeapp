@@ -2,8 +2,10 @@ import { Router, Request, Response } from 'express';
 import { pool } from './db';
 import bcrypt from 'bcrypt';
 import jwt from 'jsonwebtoken';
+import { Resend } from 'resend';
 
 const router = Router();
+const resend = process.env.RESEND_API_KEY ? new Resend(process.env.RESEND_API_KEY) : null;
 
 interface JwtPayload {
   sub: string;
@@ -35,35 +37,319 @@ function generateTokens(userId: string, email: string, role: string) {
   return { accessToken, refreshToken, refreshExpiresAt };
 }
 
-router.post('/signup', async (req: Request, res: Response) => {
-  const { email, password, displayName } = req.body ?? {};
+// Real-time validation endpoints
+router.get('/validate/username/:username', async (req: Request, res: Response) => {
+  const { username } = req.params;
+  if (!username || username.trim().length === 0) {
+    return res.json({ available: false, message: 'Username is required' });
+  }
 
-  if (!email || !password || !displayName) {
-    return res.status(400).json({ message: 'email, password and displayName are required' });
+  try {
+    const { rows } = await pool.query('SELECT id FROM users WHERE username = $1', [
+      username.trim().toLowerCase(),
+    ]);
+    if (rows.length > 0) {
+      return res.json({ available: false, message: 'Username is not available' });
+    }
+    return res.json({ available: true });
+  } catch (err) {
+    console.error('Username validation error', err);
+    return res.status(500).json({ message: 'Internal server error' });
+  }
+});
+
+router.get('/validate/email/:email', async (req: Request, res: Response) => {
+  const { email } = req.params;
+  if (!email || email.trim().length === 0) {
+    return res.json({ available: false, message: 'Email is required' });
+  }
+
+  try {
+    const { rows } = await pool.query('SELECT id FROM users WHERE email = $1', [
+      email.trim().toLowerCase(),
+    ]);
+    if (rows.length > 0) {
+      return res.json({
+        available: false,
+        message: 'Email exists, please sign up with another email',
+      });
+    }
+    return res.json({ available: true });
+  } catch (err) {
+    console.error('Email validation error', err);
+    return res.status(500).json({ message: 'Internal server error' });
+  }
+});
+
+router.get('/validate/phone/:phone', async (req: Request, res: Response) => {
+  const { phone } = req.params;
+  if (!phone || phone.trim().length === 0) {
+    return res.json({ available: false, message: 'Phone number is required' });
+  }
+
+  try {
+    const { rows } = await pool.query('SELECT id FROM users WHERE phone_number = $1', [
+      phone.trim(),
+    ]);
+    if (rows.length > 0) {
+      return res.json({
+        available: false,
+        message: 'Phone number exists, please provide another phone number',
+      });
+    }
+    return res.json({ available: true });
+  } catch (err) {
+    console.error('Phone validation error', err);
+    return res.status(500).json({ message: 'Internal server error' });
+  }
+});
+
+// Generate and send OTP
+router.post('/otp/send', async (req: Request, res: Response) => {
+  const { email } = req.body ?? {};
+
+  if (!email || typeof email !== 'string') {
+    return res.status(400).json({ message: 'Email is required' });
+  }
+
+  if (!resend) {
+    return res.status(500).json({ message: 'Email service is not configured' });
+  }
+
+  const client = await pool.connect();
+  try {
+    // Generate 4-digit OTP
+    const otpCode = Math.floor(1000 + Math.random() * 9000).toString();
+    const expiresAt = new Date();
+    expiresAt.setSeconds(expiresAt.getSeconds() + 60); // 60 seconds expiry
+
+    // Delete any existing OTPs for this email
+    await client.query('DELETE FROM otp_verifications WHERE email = $1', [
+      email.toLowerCase().trim(),
+    ]);
+
+    // Insert new OTP
+    await client.query(
+      `INSERT INTO otp_verifications (email, otp_code, expires_at)
+       VALUES ($1, $2, $3)`,
+      [email.toLowerCase().trim(), otpCode, expiresAt],
+    );
+
+    // Send email via Resend
+    const emailHtml = `
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Verify Your Email - My Time</title>
+</head>
+<body style="margin: 0; padding: 0; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif; background-color: #f5f5f5;">
+  <table role="presentation" style="width: 100%; border-collapse: collapse; background-color: #f5f5f5;">
+    <tr>
+      <td align="center" style="padding: 40px 20px;">
+        <table role="presentation" style="max-width: 600px; width: 100%; border-collapse: collapse; background-color: #ffffff; border-radius: 16px; box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);">
+          <!-- Header -->
+          <tr>
+            <td style="padding: 40px 40px 20px; text-align: center; background: linear-gradient(135deg, #6366F1 0%, #8B5CF6 100%); border-radius: 16px 16px 0 0;">
+              <h1 style="margin: 0; color: #ffffff; font-size: 28px; font-weight: 700;">My Time</h1>
+            </td>
+          </tr>
+          
+          <!-- Content -->
+          <tr>
+            <td style="padding: 40px;">
+              <h2 style="margin: 0 0 16px; color: #1F2937; font-size: 24px; font-weight: 600;">Verify Your Email</h2>
+              <p style="margin: 0 0 24px; color: #6B7280; font-size: 16px; line-height: 1.6;">
+                Thank you for signing up! Please use the verification code below to complete your registration.
+              </p>
+              
+              <!-- OTP Code Box -->
+              <div style="background-color: #F9FAFB; border: 2px dashed #6366F1; border-radius: 12px; padding: 32px; text-align: center; margin: 32px 0;">
+                <div style="font-size: 48px; font-weight: 700; color: #6366F1; letter-spacing: 8px; font-family: 'Courier New', monospace;">
+                  ${otpCode}
+                </div>
+              </div>
+              
+              <p style="margin: 24px 0 0; color: #9CA3AF; font-size: 14px; line-height: 1.6;">
+                This code will expire in <strong style="color: #6366F1;">60 seconds</strong>. If you didn't request this code, please ignore this email.
+              </p>
+            </td>
+          </tr>
+          
+          <!-- Footer -->
+          <tr>
+            <td style="padding: 24px 40px; background-color: #F9FAFB; border-radius: 0 0 16px 16px; text-align: center;">
+              <p style="margin: 0; color: #9CA3AF; font-size: 12px;">
+                © ${new Date().getFullYear()} My Time. All rights reserved.
+              </p>
+            </td>
+          </tr>
+        </table>
+      </td>
+    </tr>
+  </table>
+</body>
+</html>
+    `;
+
+    await resend.emails.send({
+      from: process.env.RESEND_FROM_EMAIL || 'My Time <onboarding@resend.dev>',
+      to: email.toLowerCase().trim(),
+      subject: 'Verify Your Email - My Time',
+      html: emailHtml,
+    });
+
+    return res.json({ success: true, message: 'OTP sent successfully' });
+  } catch (err) {
+    console.error('OTP send error', err);
+    return res.status(500).json({ message: 'Failed to send OTP' });
+  } finally {
+    client.release();
+  }
+});
+
+// Verify OTP
+router.post('/otp/verify', async (req: Request, res: Response) => {
+  const { email, otpCode } = req.body ?? {};
+
+  if (!email || !otpCode) {
+    return res.status(400).json({ message: 'Email and OTP code are required' });
+  }
+
+  const client = await pool.connect();
+  try {
+    const { rows } = await client.query(
+      `SELECT id, expires_at, verified
+       FROM otp_verifications
+       WHERE email = $1 AND otp_code = $2
+       ORDER BY created_at DESC
+       LIMIT 1`,
+      [email.toLowerCase().trim(), otpCode],
+    );
+
+    if (rows.length === 0) {
+      return res.status(400).json({ message: 'Invalid OTP code' });
+    }
+
+    const otpRecord = rows[0];
+    const now = new Date();
+    const expiresAt = new Date(otpRecord.expires_at);
+
+    if (expiresAt.getTime() <= now.getTime()) {
+      return res.status(400).json({ message: 'OTP has expired' });
+    }
+
+    if (otpRecord.verified) {
+      return res.status(400).json({ message: 'OTP has already been used' });
+    }
+
+    // Mark OTP as verified
+    await client.query('UPDATE otp_verifications SET verified = TRUE WHERE id = $1', [
+      otpRecord.id,
+    ]);
+
+    return res.json({ success: true, message: 'OTP verified successfully' });
+  } catch (err) {
+    console.error('OTP verify error', err);
+    return res.status(500).json({ message: 'Internal server error' });
+  } finally {
+    client.release();
+  }
+});
+
+// Updated signup endpoint with OTP verification
+router.post('/signup', async (req: Request, res: Response) => {
+  const { email, password, displayName, username, phoneNumber, otpCode } = req.body ?? {};
+
+  if (!email || !password || !displayName || !username || !phoneNumber) {
+    return res.status(400).json({
+      message: 'email, password, displayName, username, and phoneNumber are required',
+    });
+  }
+
+  if (!otpCode) {
+    return res.status(400).json({ message: 'OTP verification is required' });
   }
 
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
 
-    const existing = await client.query('SELECT id FROM users WHERE email = $1', [
-      String(email).toLowerCase(),
+    // Verify OTP first
+    const otpResult = await client.query(
+      `SELECT id, expires_at, verified
+       FROM otp_verifications
+       WHERE email = $1 AND otp_code = $2
+       ORDER BY created_at DESC
+       LIMIT 1`,
+      [String(email).toLowerCase().trim(), otpCode],
+    );
+
+    if (otpResult.rows.length === 0) {
+      await client.query('ROLLBACK');
+      return res.status(400).json({ message: 'Invalid OTP code' });
+    }
+
+    const otpRecord = otpResult.rows[0];
+    const now = new Date();
+    const expiresAt = new Date(otpRecord.expires_at);
+
+    if (expiresAt.getTime() <= now.getTime()) {
+      await client.query('ROLLBACK');
+      return res.status(400).json({ message: 'OTP has expired' });
+    }
+
+    if (otpRecord.verified) {
+      await client.query('ROLLBACK');
+      return res.status(400).json({ message: 'OTP has already been used' });
+    }
+
+    // Check for existing users
+    const existingEmail = await client.query('SELECT id FROM users WHERE email = $1', [
+      String(email).toLowerCase().trim(),
     ]);
-    const existingCount = existing.rowCount ?? 0;
-    if (existingCount > 0) {
+    if (existingEmail.rowCount && existingEmail.rowCount > 0) {
       await client.query('ROLLBACK');
       return res.status(409).json({ message: 'Email already in use' });
+    }
+
+    const existingUsername = await client.query('SELECT id FROM users WHERE username = $1', [
+      String(username).trim().toLowerCase(),
+    ]);
+    if (existingUsername.rowCount && existingUsername.rowCount > 0) {
+      await client.query('ROLLBACK');
+      return res.status(409).json({ message: 'Username is not available' });
+    }
+
+    const existingPhone = await client.query('SELECT id FROM users WHERE phone_number = $1', [
+      String(phoneNumber).trim(),
+    ]);
+    if (existingPhone.rowCount && existingPhone.rowCount > 0) {
+      await client.query('ROLLBACK');
+      return res.status(409).json({ message: 'Phone number already in use' });
     }
 
     const passwordHash = await bcrypt.hash(String(password), 12);
 
     const { rows } = await client.query(
-      `INSERT INTO users (email, password_hash, display_name)
-       VALUES ($1, $2, $3)
-       RETURNING id, email, display_name, role`,
-      [String(email).toLowerCase(), passwordHash, displayName],
+      `INSERT INTO users (email, password_hash, display_name, username, phone_number, email_verified)
+       VALUES ($1, $2, $3, $4, $5, TRUE)
+       RETURNING id, email, display_name, username, phone_number, role`,
+      [
+        String(email).toLowerCase().trim(),
+        passwordHash,
+        displayName,
+        String(username).trim().toLowerCase(),
+        String(phoneNumber).trim(),
+      ],
     );
     const user = rows[0];
+
+    // Mark OTP as verified
+    await client.query('UPDATE otp_verifications SET verified = TRUE WHERE id = $1', [
+      otpRecord.id,
+    ]);
 
     const { accessToken, refreshToken, refreshExpiresAt } = generateTokens(
       user.id,
@@ -84,14 +370,20 @@ router.post('/signup', async (req: Request, res: Response) => {
         id: user.id,
         email: user.email,
         displayName: user.display_name,
+        username: user.username,
+        phoneNumber: user.phone_number,
         role: user.role,
       },
       accessToken,
       refreshToken,
     });
-  } catch (err) {
+  } catch (err: any) {
     await client.query('ROLLBACK');
     console.error('Signup error', err);
+    if (err.code === '23505') {
+      // Unique constraint violation
+      return res.status(409).json({ message: 'Username, email, or phone number already in use' });
+    }
     return res.status(500).json({ message: 'Internal server error' });
   } finally {
     client.release();

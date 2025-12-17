@@ -2,6 +2,7 @@ import express from 'express';
 import cors from 'cors';
 import dotenv from 'dotenv';
 import authRouter from './auth';
+import userRouter from './routes/user';
 
 dotenv.config();
 
@@ -15,7 +16,11 @@ app.get('/health', (_req, res) => {
   res.json({ status: 'ok' });
 });
 
+// Public routes
 app.use('/auth', authRouter);
+
+// Protected routes (require authentication)
+app.use('/user', userRouter);
 
 app.listen(port, () => {
   // eslint-disable-next-line no-console
