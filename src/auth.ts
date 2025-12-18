@@ -789,7 +789,6 @@ router.post('/reset-password/confirm', authenticateToken, async (req: Request, r
 
     const otpRecord = otpRows[0];
     const now = new Date();
-    thead
     const expiresAt = new Date(otpRecord.expires_at);
 
     if (expiresAt.getTime() <= now.getTime()) {
@@ -1022,21 +1021,6 @@ router.post('/forgot-password/reset', async (req: Request, res: Response) => {
     if (rows.length === 0) {
       await client.query('ROLLBACK');
       return res.status(404).json({ message: 'User not found' });
-    }
-
-    // Prevent reusing the same password
-    const { rows: userRows } = await client.query(
-      'SELECT password_hash FROM users WHERE email = $1',
-      [email.toLowerCase().trim()],
-    );
-    if (userRows.length > 0) {
-      const isSame = await bcrypt.compare(String(newPassword), userRows[0].password_hash);
-      if (isSame) {
-        await client.query('ROLLBACK');
-        return res
-          .status(400)
-          .json({ message: 'New password must be different from your previous password' });
-      }
     }
 
     // Prevent reusing the same password
