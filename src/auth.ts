@@ -589,6 +589,245 @@ router.post('/refresh', async (req: Request, res: Response) => {
   }
 });
 
+// Reset Password (logged-in) - send OTP
+router.post('/reset-password/send-otp', authenticateToken, async (req: Request, res: Response) => {
+  const { currentPassword, newPassword } = req.body ?? {};
+  const userId = req.user!.id;
+
+  if (!currentPassword || !newPassword) {
+    return res.status(400).json({
+      message: 'Current password and new password are required',
+    });
+  }
+
+  if (newPassword.length < 8) {
+    return res.status(400).json({ message: 'Password must be at least 8 characters long' });
+  }
+
+  if (!resend) {
+    return res.status(500).json({ message: 'Email service is not configured' });
+  }
+
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+
+    const { rows } = await client.query(
+      'SELECT email, password_hash, display_name FROM users WHERE id = $1',
+      [userId],
+    );
+
+    if (rows.length === 0) {
+      await client.query('ROLLBACK');
+      return res.status(404).json({ message: 'User not found' });
+    }
+
+    const user = rows[0];
+
+    // Verify current password
+    const valid = await bcrypt.compare(String(currentPassword), user.password_hash);
+    if (!valid) {
+      await client.query('ROLLBACK');
+      return res.status(401).json({ message: 'Current password is incorrect' });
+    }
+
+    // Ensure new password is different from old
+    const isSame = await bcrypt.compare(String(newPassword), user.password_hash);
+    if (isSame) {
+      await client.query('ROLLBACK');
+      return res
+        .status(400)
+        .json({ message: 'New password must be different from your previous password' });
+    }
+
+    // Generate OTP
+    const otpCode = Math.floor(1000 + Math.random() * 9000).toString();
+    const expiresAt = new Date();
+    expiresAt.setSeconds(expiresAt.getSeconds() + 60); // 60 seconds
+
+    // Clear existing unverified OTPs
+    await client.query('DELETE FROM otp_verifications WHERE email = $1 AND verified = FALSE', [
+      user.email.toLowerCase().trim(),
+    ]);
+
+    await client.query(
+      `INSERT INTO otp_verifications (email, otp_code, expires_at)
+       VALUES ($1, $2, $3)`,
+      [user.email.toLowerCase().trim(), otpCode, expiresAt],
+    );
+
+    const emailHtml = `
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Confirm Password Change - My Time</title>
+</head>
+<body style="margin: 0; padding: 0; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif; background-color: #f5f5f5;">
+  <table role="presentation" style="width: 100%; border-collapse: collapse; background-color: #f5f5f5;">
+    <tr>
+      <td align="center" style="padding: 40px 20px;">
+        <table role="presentation" style="max-width: 600px; width: 100%; border-collapse: collapse; background-color: #ffffff; border-radius: 16px; box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);">
+          <tr>
+            <td style="padding: 40px 40px 20px; text-align: center; background: linear-gradient(135deg, #6366F1 0%, #8B5CF6 100%); border-radius: 16px 16px 0 0;">
+              <h1 style="margin: 0; color: #ffffff; font-size: 28px; font-weight: 700;">My Time</h1>
+            </td>
+          </tr>
+          <tr>
+            <td style="padding: 40px;">
+              <h2 style="margin: 0 0 16px; color: #1F2937; font-size: 24px; font-weight: 600;">Confirm Your Password Change</h2>
+              <p style="margin: 0 0 24px; color: #6B7280; font-size: 16px; line-height: 1.6;">
+                Hi ${user.display_name},<br><br>
+                We received a request to change the password for your account. Use the verification code below to confirm this change.
+              </p>
+              <div style="background-color: #F9FAFB; border: 2px dashed #6366F1; border-radius: 12px; padding: 32px; text-align: center; margin: 32px 0;">
+                <div style="font-size: 48px; font-weight: 700; color: #6366F1; letter-spacing: 8px; font-family: 'Courier New', monospace;">
+                  ${otpCode}
+                </div>
+              </div>
+              <p style="margin: 24px 0 0; color: #9CA3AF; font-size: 14px; line-height: 1.6;">
+                This code will expire in <strong style="color: #6366F1;">60 seconds</strong>. If you did not request this change, please secure your account immediately.
+              </p>
+            </td>
+          </tr>
+          <tr>
+            <td style="padding: 24px 40px; background-color: #F9FAFB; border-radius: 0 0 16px 16px; text-align: center;">
+              <p style="margin: 0; color: #9CA3AF; font-size: 12px;">
+                © ${new Date().getFullYear()} My Time. All rights reserved.
+              </p>
+            </td>
+          </tr>
+        </table>
+      </td>
+    </tr>
+  </table>
+</body>
+</html>
+    `;
+
+    await resend!.emails.send({
+      from: process.env.RESEND_FROM_EMAIL || 'My Time <onboarding@resend.dev>',
+      to: user.email.toLowerCase().trim(),
+      subject: 'Confirm Your Password Change - My Time',
+      html: emailHtml,
+    });
+
+    await client.query('COMMIT');
+
+    return res.json({ success: true, message: 'Verification code sent to your email' });
+  } catch (err) {
+    await client.query('ROLLBACK');
+    console.error('Reset password send OTP error', err);
+    return res.status(500).json({ message: 'Failed to send verification code' });
+  } finally {
+    client.release();
+  }
+});
+
+// Reset Password (logged-in) - confirm with OTP
+router.post('/reset-password/confirm', authenticateToken, async (req: Request, res: Response) => {
+  const { currentPassword, newPassword, otpCode } = req.body ?? {};
+  const userId = req.user!.id;
+
+  if (!currentPassword || !newPassword || !otpCode) {
+    return res.status(400).json({
+      message: 'Current password, new password and OTP code are required',
+    });
+  }
+
+  if (newPassword.length < 8) {
+    return res.status(400).json({ message: 'Password must be at least 8 characters long' });
+  }
+
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+
+    const { rows: userRows } = await client.query(
+      'SELECT email, password_hash, display_name FROM users WHERE id = $1',
+      [userId],
+    );
+
+    if (userRows.length === 0) {
+      await client.query('ROLLBACK');
+      return res.status(404).json({ message: 'User not found' });
+    }
+
+    const user = userRows[0];
+
+    // Verify current password again
+    const valid = await bcrypt.compare(String(currentPassword), user.password_hash);
+    if (!valid) {
+      await client.query('ROLLBACK');
+      return res.status(401).json({ message: 'Current password is incorrect' });
+    }
+
+    // Prevent reusing the same password
+    const isSame = await bcrypt.compare(String(newPassword), user.password_hash);
+    if (isSame) {
+      await client.query('ROLLBACK');
+      return res
+        .status(400)
+        .json({ message: 'New password must be different from your previous password' });
+    }
+
+    // Verify OTP
+    const { rows: otpRows } = await client.query(
+      `SELECT id, expires_at, verified
+       FROM otp_verifications
+       WHERE email = $1 AND otp_code = $2
+       ORDER BY created_at DESC
+       LIMIT 1`,
+      [user.email.toLowerCase().trim(), otpCode],
+    );
+
+    if (otpRows.length === 0) {
+      await client.query('ROLLBACK');
+      return res.status(400).json({ message: 'Invalid OTP code' });
+    }
+
+    const otpRecord = otpRows[0];
+    const now = new Date();
+    thead
+    const expiresAt = new Date(otpRecord.expires_at);
+
+    if (expiresAt.getTime() <= now.getTime()) {
+      await client.query('ROLLBACK');
+      return res.status(400).json({ message: 'OTP has expired' });
+    }
+
+    if (otpRecord.verified) {
+      await client.query('ROLLBACK');
+      return res.status(400).json({ message: 'OTP has already been used' });
+    }
+
+    // Hash new password
+    const passwordHash = await bcrypt.hash(String(newPassword), 12);
+
+    // Update password
+    await client.query('UPDATE users SET password_hash = $1 WHERE id = $2', [
+      passwordHash,
+      userId,
+    ]);
+
+    // Mark OTP as verified
+    await client.query('UPDATE otp_verifications SET verified = TRUE WHERE id = $1', [
+      otpRecord.id,
+    ]);
+
+    await client.query('COMMIT');
+
+    return res.json({ success: true, message: 'Password has been updated successfully' });
+  } catch (err) {
+    await client.query('ROLLBACK');
+    console.error('Reset password confirm error', err);
+    return res.status(500).json({ message: 'Internal server error' });
+  } finally {
+    client.release();
+  }
+});
+
 router.post('/logout', async (req: Request, res: Response) => {
   const { refreshToken } = req.body ?? {};
   if (!refreshToken || typeof refreshToken !== 'string') {
@@ -785,6 +1024,36 @@ router.post('/forgot-password/reset', async (req: Request, res: Response) => {
       return res.status(404).json({ message: 'User not found' });
     }
 
+    // Prevent reusing the same password
+    const { rows: userRows } = await client.query(
+      'SELECT password_hash FROM users WHERE email = $1',
+      [email.toLowerCase().trim()],
+    );
+    if (userRows.length > 0) {
+      const isSame = await bcrypt.compare(String(newPassword), userRows[0].password_hash);
+      if (isSame) {
+        await client.query('ROLLBACK');
+        return res
+          .status(400)
+          .json({ message: 'New password must be different from your previous password' });
+      }
+    }
+
+    // Prevent reusing the same password
+    const { rows: userRows } = await client.query(
+      'SELECT password_hash FROM users WHERE email = $1',
+      [email.toLowerCase().trim()],
+    );
+    if (userRows.length > 0) {
+      const isSame = await bcrypt.compare(String(newPassword), userRows[0].password_hash);
+      if (isSame) {
+        await client.query('ROLLBACK');
+        return res
+          .status(400)
+          .json({ message: 'New password must be different from your previous password' });
+      }
+    }
+
     // Hash new password
     const passwordHash = await bcrypt.hash(String(newPassword), 12);
 
@@ -850,6 +1119,15 @@ router.post('/reset-password', authenticateToken, async (req: Request, res: Resp
     if (!valid) {
       await client.query('ROLLBACK');
       return res.status(401).json({ message: 'Current password is incorrect' });
+    }
+
+    // Prevent reusing the same password
+    const isSame = await bcrypt.compare(String(newPassword), rows[0].password_hash);
+    if (isSame) {
+      await client.query('ROLLBACK');
+      return res
+        .status(400)
+        .json({ message: 'New password must be different from your previous password' });
     }
 
     // Hash new password
