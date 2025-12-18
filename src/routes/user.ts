@@ -97,25 +97,74 @@ router.put('/me', authenticateToken, async (req: Request, res: Response) => {
       }
     }
 
-    // Perform update using COALESCE-style logic
+    // Prepare values for update
+    const usernameValue =
+      typeof username === 'undefined' ? null : String(username).trim() || null;
+    const phoneValue =
+      typeof phoneNumber === 'undefined' ? null : String(phoneNumber).trim() || null;
+    const cityValue = typeof city === 'undefined' ? null : String(city).trim() || null;
+    const countryValue =
+      typeof country === 'undefined' ? null : String(country).trim() || null;
+
+    // Handle date_of_birth - validate format if provided
+    let dateValue: string | null = null;
+    if (typeof dateOfBirth !== 'undefined' && dateOfBirth !== null && dateOfBirth !== '') {
+      const trimmedDate = String(dateOfBirth).trim();
+      if (trimmedDate) {
+        // Validate date format YYYY-MM-DD
+        if (!/^\d{4}-\d{2}-\d{2}$/.test(trimmedDate)) {
+          await client.query('ROLLBACK');
+          return res.status(400).json({ message: 'Date of birth must be in YYYY-MM-DD format' });
+        }
+        dateValue = trimmedDate;
+      }
+    }
+
+    // Build dynamic UPDATE query based on what's provided
+    const updates: string[] = [];
+    const values: any[] = [];
+    let paramIndex = 1;
+
+    if (typeof username !== 'undefined') {
+      updates.push(`username = $${paramIndex}`);
+      values.push(usernameValue);
+      paramIndex++;
+    }
+    if (typeof phoneNumber !== 'undefined') {
+      updates.push(`phone_number = $${paramIndex}`);
+      values.push(phoneValue);
+      paramIndex++;
+    }
+    if (typeof dateOfBirth !== 'undefined') {
+      updates.push(`date_of_birth = $${paramIndex}::date`);
+      values.push(dateValue);
+      paramIndex++;
+    }
+    if (typeof city !== 'undefined') {
+      updates.push(`city = $${paramIndex}`);
+      values.push(cityValue);
+      paramIndex++;
+    }
+    if (typeof country !== 'undefined') {
+      updates.push(`country = $${paramIndex}`);
+      values.push(countryValue);
+      paramIndex++;
+    }
+
+    if (updates.length === 0) {
+      await client.query('ROLLBACK');
+      return res.status(400).json({ message: 'No profile fields provided to update' });
+    }
+
+    values.push(userId);
+
     const { rows } = await client.query(
       `UPDATE users
-       SET username = COALESCE($1, username),
-           phone_number = COALESCE($2, phone_number),
-           date_of_birth = COALESCE($3::date, date_of_birth),
-           city = COALESCE($4, city),
-           country = COALESCE($5, country)
-       WHERE id = $6
+       SET ${updates.join(', ')}
+       WHERE id = $${paramIndex}
        RETURNING id, email, display_name, role, created_at,
                  username, phone_number, date_of_birth, city, country`,
-      [
-        typeof username === 'undefined' ? null : String(username).trim() || null,
-        typeof phoneNumber === 'undefined' ? null : String(phoneNumber).trim() || null,
-        typeof dateOfBirth === 'undefined' ? null : String(dateOfBirth).trim() || null,
-        typeof city === 'undefined' ? null : String(city).trim() || null,
-        typeof country === 'undefined' ? null : String(country).trim() || null,
-        userId,
-      ],
+      values,
     );
 
     await client.query('COMMIT');
