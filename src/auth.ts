@@ -476,19 +476,28 @@ router.post('/signup', async (req: Request, res: Response) => {
 });
 
 router.post('/login', async (req: Request, res: Response) => {
-  const { email, password } = req.body ?? {};
+  const { identifier, email, password } = req.body ?? {};
 
-  if (!email || !password) {
-    return res.status(400).json({ message: 'email and password are required' });
+  const loginId = (identifier ?? email)?.toString().trim();
+
+  if (!loginId || !password) {
+    return res
+      .status(400)
+      .json({ message: 'identifier (email, username, or phone number) and password are required' });
   }
 
   const client = await pool.connect();
   try {
     const { rows } = await client.query(
-      `SELECT id, email, password_hash, display_name, role
+      `SELECT id, email, password_hash, display_name, role, username, phone_number
        FROM users
-       WHERE email = $1 AND is_active = TRUE`,
-      [String(email).toLowerCase()],
+       WHERE is_active = TRUE
+         AND (
+           LOWER(email) = LOWER($1)
+           OR LOWER(username) = LOWER($1)
+           OR phone_number = $1
+         )`,
+      [loginId],
     );
     const user = rows[0];
     if (!user) {
