@@ -33,7 +33,9 @@ router.get('/me', authenticateToken, async (req: Request, res: Response) => {
       createdAt: user.created_at,
       username: user.username,
       phoneNumber: user.phone_number,
-      dateOfBirth: user.date_of_birth,
+      dateOfBirth: user.date_of_birth
+        ? (user.date_of_birth as Date).toISOString().slice(0, 10)
+        : null,
       city: user.city,
       country: user.country,
     });
@@ -71,12 +73,56 @@ router.put('/me', authenticateToken, async (req: Request, res: Response) => {
   try {
     await client.query('BEGIN');
 
-    // Check username uniqueness if provided
-    if (typeof username !== 'undefined' && username !== null && username !== '') {
+    // Load current user to enforce non-editable username/phone once set
+    const currentResult = await client.query(
+      `SELECT username, phone_number FROM users WHERE id = $1`,
+      [userId],
+    );
+    if (currentResult.rowCount === 0) {
+      await client.query('ROLLBACK');
+      return res.status(404).json({ message: 'User not found' });
+    }
+    const currentUser = currentResult.rows[0];
+
+    const requestedUsername =
+      typeof username === 'undefined' || username === null || username === ''
+        ? undefined
+        : String(username).trim();
+    const requestedPhone =
+      typeof phoneNumber === 'undefined' || phoneNumber === null || phoneNumber === ''
+        ? undefined
+        : String(phoneNumber).trim();
+
+    // If username already exists, it cannot be changed
+    if (
+      currentUser.username &&
+      typeof requestedUsername !== 'undefined' &&
+      requestedUsername.toLowerCase() !== String(currentUser.username).toLowerCase()
+    ) {
+      await client.query('ROLLBACK');
+      return res
+        .status(400)
+        .json({ message: 'Username cannot be changed once it has been set' });
+    }
+
+    // If phone number already exists, it cannot be changed
+    if (
+      currentUser.phone_number &&
+      typeof requestedPhone !== 'undefined' &&
+      requestedPhone !== String(currentUser.phone_number)
+    ) {
+      await client.query('ROLLBACK');
+      return res
+        .status(400)
+        .json({ message: 'Phone number cannot be changed once it has been set' });
+    }
+
+    // Check username uniqueness if provided (for first-time set or same value)
+    if (typeof requestedUsername !== 'undefined') {
       const existingUsername = await client.query(
         `SELECT id FROM users
          WHERE LOWER(username) = LOWER($1) AND id <> $2`,
-        [String(username).trim(), userId],
+        [requestedUsername, userId],
       );
       if (existingUsername.rowCount && existingUsername.rowCount > 0) {
         await client.query('ROLLBACK');
@@ -84,12 +130,12 @@ router.put('/me', authenticateToken, async (req: Request, res: Response) => {
       }
     }
 
-    // Check phone uniqueness if provided
-    if (typeof phoneNumber !== 'undefined' && phoneNumber !== null && phoneNumber !== '') {
+    // Check phone uniqueness if provided (for first-time set or same value)
+    if (typeof requestedPhone !== 'undefined') {
       const existingPhone = await client.query(
         `SELECT id FROM users
          WHERE phone_number = $1 AND id <> $2`,
-        [String(phoneNumber).trim(), userId],
+        [requestedPhone, userId],
       );
       if (existingPhone.rowCount && existingPhone.rowCount > 0) {
         await client.query('ROLLBACK');
@@ -99,9 +145,9 @@ router.put('/me', authenticateToken, async (req: Request, res: Response) => {
 
     // Prepare values for update
     const usernameValue =
-      typeof username === 'undefined' ? null : String(username).trim() || null;
+      typeof requestedUsername === 'undefined' ? undefined : requestedUsername || null;
     const phoneValue =
-      typeof phoneNumber === 'undefined' ? null : String(phoneNumber).trim() || null;
+      typeof requestedPhone === 'undefined' ? undefined : requestedPhone || null;
     const cityValue = typeof city === 'undefined' ? null : String(city).trim() || null;
     const countryValue =
       typeof country === 'undefined' ? null : String(country).trim() || null;
@@ -125,12 +171,12 @@ router.put('/me', authenticateToken, async (req: Request, res: Response) => {
     const values: any[] = [];
     let paramIndex = 1;
 
-    if (typeof username !== 'undefined') {
+    if (typeof usernameValue !== 'undefined') {
       updates.push(`username = $${paramIndex}`);
       values.push(usernameValue);
       paramIndex++;
     }
-    if (typeof phoneNumber !== 'undefined') {
+    if (typeof phoneValue !== 'undefined') {
       updates.push(`phone_number = $${paramIndex}`);
       values.push(phoneValue);
       paramIndex++;
@@ -178,7 +224,9 @@ router.put('/me', authenticateToken, async (req: Request, res: Response) => {
       createdAt: user.created_at,
       username: user.username,
       phoneNumber: user.phone_number,
-      dateOfBirth: user.date_of_birth,
+      dateOfBirth: user.date_of_birth
+        ? (user.date_of_birth as Date).toISOString().slice(0, 10)
+        : null,
       city: user.city,
       country: user.country,
     });
