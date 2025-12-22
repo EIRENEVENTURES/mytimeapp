@@ -406,6 +406,16 @@ router.get('/search', authenticateToken, async (req: Request, res: Response) => 
     const nextCursor = hasMore ? offset + limit : null;
 
     const now = Date.now();
+    const currentUserId = req.user!.id;
+
+    // Get all contact IDs for the current user
+    const contactsResult = await pool.query(
+      `SELECT contact_user_id FROM contacts WHERE user_id = $1`,
+      [currentUserId],
+    );
+    const contactIds = new Set(
+      contactsResult.rows.map((row) => row.contact_user_id as string),
+    );
 
     return res.json({
       users: users.map((u) => {
@@ -435,6 +445,7 @@ router.get('/search', authenticateToken, async (req: Request, res: Response) => 
           country: u.country,
           bio: u.bio,
           activityStatus,
+          isFollowing: contactIds.has(u.id),
         };
       }),
       nextCursor,
@@ -513,6 +524,77 @@ router.post(
       await client.query('ROLLBACK');
       console.error('Add contact error', err);
       return res.status(500).json({ message: 'Failed to add contact' });
+    } finally {
+      client.release();
+    }
+  },
+);
+
+/**
+ * DELETE /user/me/contacts/:contactId
+ * Remove a user from the current user's contacts.
+ */
+router.delete(
+  '/me/contacts/:contactId',
+  authenticateToken,
+  async (req: Request, res: Response) => {
+    const userId = req.user!.id;
+    const { contactId } = req.params;
+
+    if (!contactId) {
+      return res.status(400).json({ message: 'Contact id is required' });
+    }
+
+    if (contactId === userId) {
+      return res.status(400).json({ message: 'You cannot remove yourself as a contact' });
+    }
+
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+
+      const { rows } = await client.query(
+        'SELECT id, display_name FROM users WHERE id = $1',
+        [contactId],
+      );
+
+      if (rows.length === 0) {
+        await client.query('ROLLBACK');
+        return res.status(404).json({ message: 'User not found' });
+      }
+
+      const contactName = rows[0].display_name as string;
+
+      // Check if contact exists
+      const existingContact = await client.query(
+        `SELECT id FROM contacts WHERE user_id = $1 AND contact_user_id = $2`,
+        [userId, contactId],
+      );
+
+      if (!existingContact.rowCount || existingContact.rowCount === 0) {
+        await client.query('ROLLBACK');
+        return res.status(404).json({
+          success: false,
+          message: `${contactName} is not in your contact list`,
+        });
+      }
+
+      // Delete the contact
+      await client.query(
+        `DELETE FROM contacts WHERE user_id = $1 AND contact_user_id = $2`,
+        [userId, contactId],
+      );
+
+      await client.query('COMMIT');
+
+      return res.json({
+        success: true,
+        message: `${contactName} has been removed from your contact list`,
+      });
+    } catch (err) {
+      await client.query('ROLLBACK');
+      console.error('Remove contact error', err);
+      return res.status(500).json({ message: 'Failed to remove contact' });
     } finally {
       client.release();
     }
