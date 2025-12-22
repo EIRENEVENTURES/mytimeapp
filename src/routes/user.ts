@@ -62,18 +62,18 @@ router.get('/me', authenticateToken, async (req: Request, res: Response) => {
       displayName: user.display_name,
       role: user.role,
       createdAt: user.created_at,
-      username: user.username,
-      phoneNumber: user.phone_number,
+      username: user.username ?? null,
+      phoneNumber: user.phone_number ?? null,
       dateOfBirth: user.date_of_birth
         ? (user.date_of_birth as Date).toISOString().slice(0, 10)
         : null,
-      city: user.city,
-      country: user.country,
-      bio: user.bio,
-      creditPerSecond: user.credit_per_second,
-      specialty: user.specialty,
-      links: user.links,
-      ratings: user.ratings,
+      city: user.city ?? null,
+      country: user.country ?? null,
+      bio: user.bio ?? null,
+      creditPerSecond: user.credit_per_second ?? null,
+      specialty: user.specialty ?? null,
+      links: user.links ?? null,
+      ratings: user.ratings ?? null,
       followers,
       following,
     });
@@ -387,6 +387,7 @@ router.get('/search', authenticateToken, async (req: Request, res: Response) => 
         credit_per_second,
         ratings,
         country,
+        bio,
         last_seen_at
       FROM users
       WHERE is_active = TRUE
@@ -432,6 +433,7 @@ router.get('/search', authenticateToken, async (req: Request, res: Response) => 
           creditPerSecond: u.credit_per_second,
           ratings: u.ratings,
           country: u.country,
+          bio: u.bio,
           activityStatus,
         };
       }),
@@ -477,6 +479,20 @@ router.post(
       }
 
       const contactName = rows[0].display_name as string;
+
+      // Check if contact already exists
+      const existingContact = await client.query(
+        `SELECT id FROM contacts WHERE user_id = $1 AND contact_user_id = $2`,
+        [userId, contactId],
+      );
+
+      if (existingContact.rowCount && existingContact.rowCount > 0) {
+        await client.query('ROLLBACK');
+        return res.status(409).json({
+          success: false,
+          message: `${contactName} is already in your contact list`,
+        });
+      }
 
       await client.query(
         `
