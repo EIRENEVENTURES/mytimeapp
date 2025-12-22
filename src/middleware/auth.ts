@@ -45,9 +45,9 @@ export async function authenticateToken(
   try {
     const decoded = jwt.verify(token, process.env.JWT_ACCESS_SECRET) as JwtPayload;
 
-    // Optionally verify user still exists and is active
+    // Verify user still exists and is active, and update last_seen_at for activity tracking
     const { rows } = await pool.query(
-      'SELECT id, email, role FROM users WHERE id = $1 AND is_active = TRUE',
+      'UPDATE users SET last_seen_at = NOW() WHERE id = $1 AND is_active = TRUE RETURNING id, email, role',
       [decoded.sub],
     );
 
@@ -56,10 +56,12 @@ export async function authenticateToken(
       return;
     }
 
+    const user = rows[0];
+
     req.user = {
-      id: decoded.sub,
-      email: decoded.email,
-      role: decoded.role,
+      id: user.id,
+      email: user.email,
+      role: user.role,
     };
 
     next();

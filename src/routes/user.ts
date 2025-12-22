@@ -366,7 +366,8 @@ router.get('/search', authenticateToken, async (req: Request, res: Response) => 
         specialty,
         credit_per_second,
         ratings,
-        country
+        country,
+        last_seen_at
       FROM users
       WHERE is_active = TRUE
         AND (
@@ -383,16 +384,37 @@ router.get('/search', authenticateToken, async (req: Request, res: Response) => 
     const users = hasMore ? rows.slice(0, limit) : rows;
     const nextCursor = hasMore ? offset + limit : null;
 
+    const now = Date.now();
+
     return res.json({
-      users: users.map((u) => ({
-        id: u.id,
-        displayName: u.display_name,
-        username: u.username,
-        specialty: u.specialty,
-        creditPerSecond: u.credit_per_second,
-        ratings: u.ratings,
-        country: u.country,
-      })),
+      users: users.map((u) => {
+        let activityStatus: 'online' | 'recent' | 'offline' = 'offline';
+        if (u.last_seen_at) {
+          const lastSeen = new Date(u.last_seen_at as Date).getTime();
+          const diffMs = now - lastSeen;
+          const diffMinutes = diffMs / (1000 * 60);
+          const diffDays = diffMs / (1000 * 60 * 60 * 24);
+
+          if (diffMinutes <= 2) {
+            activityStatus = 'online';
+          } else if (diffDays <= 3) {
+            activityStatus = 'recent';
+          } else {
+            activityStatus = 'offline';
+          }
+        }
+
+        return {
+          id: u.id,
+          displayName: u.display_name,
+          username: u.username,
+          specialty: u.specialty,
+          creditPerSecond: u.credit_per_second,
+          ratings: u.ratings,
+          country: u.country,
+          activityStatus,
+        };
+      }),
       nextCursor,
     });
   } catch (err) {
@@ -400,6 +422,66 @@ router.get('/search', authenticateToken, async (req: Request, res: Response) => 
     return res.status(500).json({ message: 'Internal server error' });
   }
 });
+
+/**
+ * POST /user/me/contacts/:contactId
+ * Add another user as a contact for the current user.
+ */
+router.post(
+  '/me/contacts/:contactId',
+  authenticateToken,
+  async (req: Request, res: Response) => {
+    const userId = req.user!.id;
+    const { contactId } = req.params;
+
+    if (!contactId) {
+      return res.status(400).json({ message: 'Contact id is required' });
+    }
+
+    if (contactId === userId) {
+      return res.status(400).json({ message: 'You cannot add yourself as a contact' });
+    }
+
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+
+      const { rows } = await client.query(
+        'SELECT id, display_name, is_active FROM users WHERE id = $1',
+        [contactId],
+      );
+
+      if (rows.length === 0 || rows[0].is_active === false) {
+        await client.query('ROLLBACK');
+        return res.status(404).json({ message: 'User not found or inactive' });
+      }
+
+      const contactName = rows[0].display_name as string;
+
+      await client.query(
+        `
+        INSERT INTO contacts (user_id, contact_user_id)
+        VALUES ($1, $2)
+        ON CONFLICT (user_id, contact_user_id) DO NOTHING
+        `,
+        [userId, contactId],
+      );
+
+      await client.query('COMMIT');
+
+      return res.json({
+        success: true,
+        message: `${contactName} has been added to your contact list`,
+      });
+    } catch (err) {
+      await client.query('ROLLBACK');
+      console.error('Add contact error', err);
+      return res.status(500).json({ message: 'Failed to add contact' });
+    } finally {
+      client.release();
+    }
+  },
+);
 
 export default router;
 
