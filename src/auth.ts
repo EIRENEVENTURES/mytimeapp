@@ -261,7 +261,8 @@ router.post('/otp/verify', async (req: Request, res: Response) => {
 
 // Updated signup endpoint with OTP verification
 router.post('/signup', async (req: Request, res: Response) => {
-  const { email, password, displayName, username, phoneNumber, otpCode } = req.body ?? {};
+  const { email, password, displayName, username, phoneNumber, otpCode, country } =
+    req.body ?? {};
 
   if (!email || !password || !displayName || !username || !phoneNumber) {
     return res.status(400).json({
@@ -334,15 +335,16 @@ router.post('/signup', async (req: Request, res: Response) => {
     const passwordHash = await bcrypt.hash(String(password), 12);
 
     const { rows } = await client.query(
-      `INSERT INTO users (email, password_hash, display_name, username, phone_number, email_verified)
-       VALUES ($1, $2, $3, $4, $5, TRUE)
-       RETURNING id, email, display_name, username, phone_number, role`,
+      `INSERT INTO users (email, password_hash, display_name, username, phone_number, email_verified, country)
+       VALUES ($1, $2, $3, $4, $5, TRUE, $6)
+       RETURNING id, email, display_name, username, phone_number, role, country`,
       [
         String(email).toLowerCase().trim(),
         passwordHash,
         displayName,
         String(username).trim().toLowerCase(),
         String(phoneNumber).trim(),
+        country ? String(country).trim() : null,
       ],
     );
     const user = rows[0];
@@ -458,6 +460,7 @@ router.post('/signup', async (req: Request, res: Response) => {
         username: user.username,
         phoneNumber: user.phone_number,
         role: user.role,
+        country: user.country,
       },
       accessToken,
       refreshToken,
