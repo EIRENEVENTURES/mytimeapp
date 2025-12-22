@@ -37,6 +37,24 @@ router.get('/me', authenticateToken, async (req: Request, res: Response) => {
       return res.status(404).json({ message: 'User not found' });
     }
 
+    // Get follower count (users who added this user as a contact)
+    const followersResult = await pool.query(
+      `SELECT COUNT(*)::int as count
+       FROM contacts
+       WHERE contact_user_id = $1`,
+      [userId],
+    );
+    const followers = followersResult.rows[0]?.count ?? 0;
+
+    // Get following count (users that this user added as contacts)
+    const followingResult = await pool.query(
+      `SELECT COUNT(*)::int as count
+       FROM contacts
+       WHERE user_id = $1`,
+      [userId],
+    );
+    const following = followingResult.rows[0]?.count ?? 0;
+
     const user = rows[0];
     return res.json({
       id: user.id,
@@ -56,6 +74,8 @@ router.get('/me', authenticateToken, async (req: Request, res: Response) => {
       specialty: user.specialty,
       links: user.links,
       ratings: user.ratings,
+      followers,
+      following,
     });
   } catch (err) {
     console.error('Get user error', err);
