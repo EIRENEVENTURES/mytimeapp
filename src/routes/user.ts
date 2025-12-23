@@ -388,7 +388,8 @@ router.get('/search', authenticateToken, async (req: Request, res: Response) => 
         ratings,
         country,
         bio,
-        last_seen_at
+        last_seen_at,
+        COALESCE(chat_rate_charging_enabled, FALSE) as chat_rate_charging_enabled
       FROM users
       WHERE is_active = TRUE
         AND (
@@ -463,6 +464,7 @@ router.get('/search', authenticateToken, async (req: Request, res: Response) => 
           activityStatus,
           isFollowing: contactIds.has(u.id),
           followers: followersMap.get(u.id) ?? 0,
+          rateChargingEnabled: u.chat_rate_charging_enabled ?? false,
         };
       }),
       nextCursor,
@@ -617,6 +619,112 @@ router.delete(
     }
   },
 );
+
+/**
+ * GET /user/me/chat-rate - Get current user's chat rate configuration
+ */
+router.get('/me/chat-rate', authenticateToken, async (req: Request, res: Response) => {
+  try {
+    const userId = req.user!.id;
+
+    const { rows } = await pool.query(
+      `SELECT 
+        COALESCE(chat_rate_per_second, credit_per_second, 0)::numeric as rate_per_second,
+        COALESCE(chat_rate_charging_enabled, FALSE) as rate_charging_enabled,
+        COALESCE(chat_auto_end_inactivity, FALSE) as auto_end_inactivity,
+        COALESCE(chat_inactivity_timeout_minutes, 5)::int as inactivity_timeout_minutes
+       FROM users
+       WHERE id = $1`,
+      [userId],
+    );
+
+    if (rows.length === 0) {
+      return res.status(404).json({ message: 'User not found' });
+    }
+
+    const user = rows[0];
+    return res.json({
+      ratePerSecond: Number(user.rate_per_second) ?? 0,
+      rateChargingEnabled: user.rate_charging_enabled ?? false,
+      autoEndInactivity: user.auto_end_inactivity ?? false,
+      inactivityTimeoutMinutes: user.inactivity_timeout_minutes ?? 5,
+    });
+  } catch (err) {
+    console.error('Get chat rate config error', err);
+    return res.status(500).json({ message: 'Internal server error' });
+  }
+});
+
+/**
+ * PUT /user/me/chat-rate - Update chat rate configuration
+ */
+router.put('/me/chat-rate', authenticateToken, async (req: Request, res: Response) => {
+  try {
+    const userId = req.user!.id;
+    const { ratePerSecond, rateChargingEnabled, autoEndInactivity, inactivityTimeoutMinutes } =
+      req.body;
+
+    // Validate ratePerSecond
+    const rate = ratePerSecond != null ? Number(ratePerSecond) : null;
+    if (rate != null && (isNaN(rate) || rate < 0)) {
+      return res.status(400).json({ message: 'Rate per second must be a non-negative number' });
+    }
+
+    // Validate inactivityTimeoutMinutes
+    const timeout =
+      inactivityTimeoutMinutes != null ? Number(inactivityTimeoutMinutes) : null;
+    if (timeout != null && (isNaN(timeout) || timeout < 1 || timeout > 1440)) {
+      return res
+        .status(400)
+        .json({ message: 'Inactivity timeout must be between 1 and 1440 minutes' });
+    }
+
+    const updateFields: string[] = [];
+    const updateValues: any[] = [];
+    let paramIndex = 1;
+
+    if (rate != null) {
+      updateFields.push(`chat_rate_per_second = $${paramIndex}`);
+      updateValues.push(rate);
+      paramIndex++;
+    }
+
+    if (typeof rateChargingEnabled === 'boolean') {
+      updateFields.push(`chat_rate_charging_enabled = $${paramIndex}`);
+      updateValues.push(rateChargingEnabled);
+      paramIndex++;
+    }
+
+    if (typeof autoEndInactivity === 'boolean') {
+      updateFields.push(`chat_auto_end_inactivity = $${paramIndex}`);
+      updateValues.push(autoEndInactivity);
+      paramIndex++;
+    }
+
+    if (timeout != null) {
+      updateFields.push(`chat_inactivity_timeout_minutes = $${paramIndex}`);
+      updateValues.push(timeout);
+      paramIndex++;
+    }
+
+    if (updateFields.length === 0) {
+      return res.status(400).json({ message: 'No fields to update' });
+    }
+
+    updateValues.push(userId);
+    const query = `UPDATE users SET ${updateFields.join(', ')} WHERE id = $${paramIndex}`;
+
+    await pool.query(query, updateValues);
+
+    return res.json({
+      success: true,
+      message: 'Chat rate configuration updated successfully',
+    });
+  } catch (err) {
+    console.error('Update chat rate config error', err);
+    return res.status(500).json({ message: 'Internal server error' });
+  }
+});
 
 export default router;
 
