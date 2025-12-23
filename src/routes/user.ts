@@ -375,6 +375,7 @@ router.get('/search', authenticateToken, async (req: Request, res: Response) => 
     const offset = Number.isFinite(cursorParam) && cursorParam >= 0 ? cursorParam : 0;
 
     const pattern = `%${rawQuery.toLowerCase()}%`;
+    const currentUserId = req.user!.id;
 
     // Fetch one extra record to know if there are more pages
     const { rows } = await pool.query(
@@ -392,14 +393,15 @@ router.get('/search', authenticateToken, async (req: Request, res: Response) => 
         COALESCE(chat_rate_charging_enabled, FALSE) as chat_rate_charging_enabled
       FROM users
       WHERE is_active = TRUE
+        AND id != $1
         AND (
-          LOWER(username) LIKE $1
-          OR LOWER(display_name) LIKE $1
+          LOWER(username) LIKE $2
+          OR LOWER(display_name) LIKE $2
         )
       ORDER BY ratings DESC NULLS LAST, display_name ASC
-      LIMIT $2 OFFSET $3
+      LIMIT $3 OFFSET $4
       `,
-      [pattern, limit + 1, offset],
+      [currentUserId, pattern, limit + 1, offset],
     );
 
     const hasMore = rows.length > limit;
@@ -407,7 +409,6 @@ router.get('/search', authenticateToken, async (req: Request, res: Response) => 
     const nextCursor = hasMore ? offset + limit : null;
 
     const now = Date.now();
-    const currentUserId = req.user!.id;
 
     // Get all contact IDs for the current user
     const contactsResult = await pool.query(
@@ -673,10 +674,10 @@ router.put('/me/chat-rate', authenticateToken, async (req: Request, res: Respons
     // Validate inactivityTimeoutMinutes
     const timeout =
       inactivityTimeoutMinutes != null ? Number(inactivityTimeoutMinutes) : null;
-    if (timeout != null && (isNaN(timeout) || timeout < 1 || timeout > 1440)) {
+    if (timeout != null && (isNaN(timeout) || timeout < 1 || timeout > 5)) {
       return res
         .status(400)
-        .json({ message: 'Inactivity timeout must be between 1 and 1440 minutes' });
+        .json({ message: 'Inactivity timeout must be between 1 and 5 minutes' });
     }
 
     const updateFields: string[] = [];
@@ -684,7 +685,9 @@ router.put('/me/chat-rate', authenticateToken, async (req: Request, res: Respons
     let paramIndex = 1;
 
     if (rate != null) {
+      // Update both chat_rate_per_second and credit_per_second to keep them in sync
       updateFields.push(`chat_rate_per_second = $${paramIndex}`);
+      updateFields.push(`credit_per_second = $${paramIndex}`);
       updateValues.push(rate);
       paramIndex++;
     }

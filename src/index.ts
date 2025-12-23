@@ -3,6 +3,7 @@ import cors from 'cors';
 import dotenv from 'dotenv';
 import authRouter from './auth';
 import userRouter from './routes/user';
+import messagesRouter from './routes/messages';
 
 dotenv.config();
 
@@ -21,6 +22,7 @@ app.use('/auth', authRouter);
 
 // Protected routes (require authentication)
 app.use('/user', userRouter);
+app.use('/messages', messagesRouter);
 
 app.listen(port, () => {
   // eslint-disable-next-line no-console
