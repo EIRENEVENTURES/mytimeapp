@@ -417,6 +417,22 @@ router.get('/search', authenticateToken, async (req: Request, res: Response) => 
       contactsResult.rows.map((row) => row.contact_user_id as string),
     );
 
+    // Get followers count for each user
+    const userIds = users.map((u) => u.id);
+    const followersMap = new Map<string, number>();
+    if (userIds.length > 0) {
+      const followersResult = await pool.query(
+        `SELECT contact_user_id, COUNT(*)::int as count
+         FROM contacts
+         WHERE contact_user_id = ANY($1::uuid[])
+         GROUP BY contact_user_id`,
+        [userIds],
+      );
+      followersResult.rows.forEach((row) => {
+        followersMap.set(row.contact_user_id as string, row.count as number);
+      });
+    }
+
     return res.json({
       users: users.map((u) => {
         let activityStatus: 'online' | 'recent' | 'offline' = 'offline';
@@ -446,6 +462,7 @@ router.get('/search', authenticateToken, async (req: Request, res: Response) => 
           bio: u.bio,
           activityStatus,
           isFollowing: contactIds.has(u.id),
+          followers: followersMap.get(u.id) ?? 0,
         };
       }),
       nextCursor,
