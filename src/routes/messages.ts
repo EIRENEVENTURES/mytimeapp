@@ -69,18 +69,95 @@ router.get('/conversation/:userId', authenticateToken, async (req: Request, res:
 
     const { rows } = await pool.query(
       `SELECT 
-        id,
-        sender_id,
-        recipient_id,
-        content,
-        status,
-        created_at
-       FROM messages
-       WHERE (sender_id = $1 AND recipient_id = $2)
-          OR (sender_id = $2 AND recipient_id = $1)
-       ORDER BY created_at ASC`,
+        m.id,
+        m.sender_id,
+        m.recipient_id,
+        m.content,
+        m.status,
+        m.created_at,
+        m.reply_to_message_id,
+        m.has_attachments
+       FROM messages m
+       WHERE (m.sender_id = $1 AND m.recipient_id = $2)
+          OR (m.sender_id = $2 AND m.recipient_id = $1)
+       ORDER BY m.created_at ASC`,
       [currentUserId, otherUserId],
     );
+
+    // Get attachments for all messages
+    const messageIds = rows.map((r) => r.id);
+    let attachmentsMap = new Map();
+    if (messageIds.length > 0) {
+      const { rows: attachmentRows } = await pool.query(
+        `SELECT 
+          message_id,
+          id,
+          type,
+          file_name,
+          file_url,
+          file_size,
+          mime_type,
+          thumbnail_url,
+          metadata
+         FROM message_attachments
+         WHERE message_id = ANY($1::uuid[])
+         ORDER BY created_at ASC`,
+        [messageIds],
+      );
+      
+      attachmentRows.forEach((att) => {
+        if (!attachmentsMap.has(att.message_id)) {
+          attachmentsMap.set(att.message_id, []);
+        }
+        attachmentsMap.get(att.message_id).push({
+          id: att.id,
+          type: att.type,
+          fileName: att.file_name,
+          fileUrl: att.file_url,
+          fileSize: att.file_size,
+          mimeType: att.mime_type,
+          thumbnailUrl: att.thumbnail_url,
+          metadata: att.metadata ? (typeof att.metadata === 'string' ? JSON.parse(att.metadata) : att.metadata) : null,
+        });
+      });
+    }
+
+    // Get reactions for all messages
+    let reactionsMap = new Map();
+    if (messageIds.length > 0) {
+      const { rows: reactionRows } = await pool.query(
+        `SELECT 
+          message_id,
+          emoji,
+          user_id
+         FROM message_reactions
+         WHERE message_id = ANY($1::uuid[])`,
+        [messageIds],
+      );
+      
+      reactionRows.forEach((r) => {
+        if (!reactionsMap.has(r.message_id)) {
+          reactionsMap.set(r.message_id, []);
+        }
+        reactionsMap.get(r.message_id).push({
+          emoji: r.emoji,
+          userId: r.user_id,
+        });
+      });
+    }
+
+    // Get starred status for current user
+    let starredSet = new Set();
+    if (messageIds.length > 0) {
+      const { rows: starredRows } = await pool.query(
+        `SELECT message_id
+         FROM starred_messages
+         WHERE message_id = ANY($1::uuid[])
+           AND user_id = $2`,
+        [messageIds, currentUserId],
+      );
+      starredRows.forEach((s) => starredSet.add(s.message_id));
+    }
 
     return res.json({
       messages: rows.map((m) => ({
@@ -90,6 +167,10 @@ router.get('/conversation/:userId', authenticateToken, async (req: Request, res:
         content: m.content,
         status: m.status,
         createdAt: m.created_at,
+        replyToMessageId: m.reply_to_message_id ?? null,
+        attachments: attachmentsMap.get(m.id) || [],
+        reactions: reactionsMap.get(m.id) || [],
+        isStarred: starredSet.has(m.id),
       })),
     });
   } catch (err) {
@@ -657,6 +738,113 @@ router.get('/attachments/:userId', authenticateToken, async (req: Request, res: 
     });
   } catch (err) {
     console.error('Get attachments error', err);
+    return res.status(500).json({ message: 'Internal server error' });
+  }
+});
+
+/**
+ * POST /messages/:messageId/star
+ * Star or unstar a message
+ */
+router.post('/:messageId/star', authenticateToken, async (req: Request, res: Response) => {
+  try {
+    const currentUserId = req.user!.id;
+    const messageId = req.params.messageId;
+
+    // Check if message exists and user has access
+    const { rows: messageRows } = await pool.query(
+      `SELECT id FROM messages 
+       WHERE id = $1 
+         AND (sender_id = $2 OR recipient_id = $2)`,
+      [messageId, currentUserId],
+    );
+
+    if (messageRows.length === 0) {
+      return res.status(404).json({ message: 'Message not found' });
+    }
+
+    // Check if already starred
+    const { rows: starredRows } = await pool.query(
+      `SELECT id FROM starred_messages 
+       WHERE message_id = $1 AND user_id = $2`,
+      [messageId, currentUserId],
+    );
+
+    if (starredRows.length > 0) {
+      // Unstar
+      await pool.query(
+        `DELETE FROM starred_messages 
+         WHERE message_id = $1 AND user_id = $2`,
+        [messageId, currentUserId],
+      );
+      return res.json({ isStarred: false });
+    } else {
+      // Star
+      await pool.query(
+        `INSERT INTO starred_messages (message_id, user_id) 
+         VALUES ($1, $2)`,
+        [messageId, currentUserId],
+      );
+      return res.json({ isStarred: true });
+    }
+  } catch (err) {
+    console.error('Star message error', err);
+    return res.status(500).json({ message: 'Internal server error' });
+  }
+});
+
+/**
+ * POST /messages/:messageId/reaction
+ * Add or remove a reaction to a message
+ */
+router.post('/:messageId/reaction', authenticateToken, async (req: Request, res: Response) => {
+  try {
+    const currentUserId = req.user!.id;
+    const messageId = req.params.messageId;
+    const { emoji } = req.body;
+
+    if (!emoji) {
+      return res.status(400).json({ message: 'Emoji is required' });
+    }
+
+    // Check if message exists and user has access
+    const { rows: messageRows } = await pool.query(
+      `SELECT id FROM messages 
+       WHERE id = $1 
+         AND (sender_id = $2 OR recipient_id = $2)`,
+      [messageId, currentUserId],
+    );
+
+    if (messageRows.length === 0) {
+      return res.status(404).json({ message: 'Message not found' });
+    }
+
+    // Check if reaction already exists
+    const { rows: reactionRows } = await pool.query(
+      `SELECT id FROM message_reactions 
+       WHERE message_id = $1 AND user_id = $2 AND emoji = $3`,
+      [messageId, currentUserId, emoji],
+    );
+
+    if (reactionRows.length > 0) {
+      // Remove reaction
+      await pool.query(
+        `DELETE FROM message_reactions 
+         WHERE message_id = $1 AND user_id = $2 AND emoji = $3`,
+        [messageId, currentUserId, emoji],
+      );
+      return res.json({ added: false });
+    } else {
+      // Add reaction
+      await pool.query(
+        `INSERT INTO message_reactions (message_id, user_id, emoji) 
+         VALUES ($1, $2, $3)`,
+        [messageId, currentUserId, emoji],
+      );
+      return res.json({ added: true });
+    }
+  } catch (err) {
+    console.error('Reaction error', err);
     return res.status(500).json({ message: 'Internal server error' });
   }
 });
