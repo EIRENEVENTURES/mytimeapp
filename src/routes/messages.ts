@@ -46,6 +46,10 @@ router.get('/conversation/:userId', authenticateToken, async (req: Request, res:
     const currentUserId = req.user!.id;
     const otherUserId = req.params.userId;
 
+    // Parse pagination parameters (cursor-based)
+    const limit = Math.min(parseInt(req.query.limit as string) || 50, 50); // Default 50, max 50
+    const before = req.query.before as string | undefined; // Message ID or timestamp to load messages before
+
     // First, mark any "sent" messages as "delivered" when user views conversation
     // (This handles the case where user was offline when message was sent)
     await pool.query(
@@ -67,8 +71,9 @@ router.get('/conversation/:userId', authenticateToken, async (req: Request, res:
       [currentUserId, otherUserId],
     );
 
-    const { rows } = await pool.query(
-      `SELECT 
+    // Build cursor-based query - load latest messages first, then reverse for chronological order
+    let query = `
+      SELECT 
         m.id,
         m.sender_id,
         m.recipient_id,
@@ -80,12 +85,37 @@ router.get('/conversation/:userId', authenticateToken, async (req: Request, res:
        FROM messages m
        WHERE (m.sender_id = $1 AND m.recipient_id = $2)
           OR (m.sender_id = $2 AND m.recipient_id = $1)
-       ORDER BY m.created_at ASC`,
-      [currentUserId, otherUserId],
-    );
+    `;
+    
+    const params: any[] = [currentUserId, otherUserId];
+    
+    // Add cursor condition if provided
+    if (before) {
+      // If before is a UUID, use it as message ID cursor
+      if (before.match(/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i)) {
+        query += ` AND m.created_at < (SELECT created_at FROM messages WHERE id = $3)`;
+        params.push(before);
+      } else {
+        // Otherwise treat as timestamp
+        query += ` AND m.created_at < $3::timestamptz`;
+        params.push(before);
+      }
+    }
+    
+    query += ` ORDER BY m.created_at DESC LIMIT $${params.length + 1}`;
+    params.push(limit + 1); // Fetch one extra to determine if there are more
+    
+    const { rows } = await pool.query(query, params);
+    
+    // Check if there are more messages
+    const hasMore = rows.length > limit;
+    const messages = hasMore ? rows.slice(0, limit) : rows;
+    
+    // Reverse to get chronological order (oldest first)
+    messages.reverse();
 
     // Get attachments for all messages
-    const messageIds = rows.map((r) => r.id);
+    const messageIds = messages.map((r) => r.id);
     let attachmentsMap = new Map();
     if (messageIds.length > 0) {
       const { rows: attachmentRows } = await pool.query(
@@ -159,8 +189,13 @@ router.get('/conversation/:userId', authenticateToken, async (req: Request, res:
       starredRows.forEach((s) => starredSet.add(s.message_id));
     }
 
+    // Get the oldest message timestamp for next cursor
+    const nextCursor = hasMore && messages.length > 0 
+      ? messages[0].created_at 
+      : null;
+
     return res.json({
-      messages: rows.map((m) => ({
+      messages: messages.map((m) => ({
         id: m.id,
         senderId: m.sender_id,
         recipientId: m.recipient_id,
@@ -172,6 +207,8 @@ router.get('/conversation/:userId', authenticateToken, async (req: Request, res:
         reactions: reactionsMap.get(m.id) || [],
         isStarred: starredSet.has(m.id),
       })),
+      hasMore,
+      nextCursor,
     });
   } catch (err) {
     console.error('Get conversation error', err);
