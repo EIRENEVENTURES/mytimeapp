@@ -17,6 +17,25 @@ const ensureUploadsDir = async () => {
 };
 ensureUploadsDir();
 
+// In-memory store for typing status (userId -> { typingUserId: timestamp })
+// In production, consider using Redis or a database table
+const typingStatus = new Map<string, Map<string, number>>();
+
+// Clean up stale typing status (older than 3 seconds)
+setInterval(() => {
+  const now = Date.now();
+  typingStatus.forEach((userMap, userId) => {
+    userMap.forEach((timestamp, typingUserId) => {
+      if (now - timestamp > 3000) {
+        userMap.delete(typingUserId);
+      }
+    });
+    if (userMap.size === 0) {
+      typingStatus.delete(userId);
+    }
+  });
+}, 1000);
+
 /**
  * GET /messages/conversation/:userId
  * Get conversation messages between current user and another user
@@ -414,6 +433,116 @@ router.get('/chats', authenticateToken, async (req: Request, res: Response) => {
     });
   } catch (err) {
     console.error('Get chats error', err);
+    return res.status(500).json({ message: 'Internal server error' });
+  }
+});
+
+/**
+ * POST /messages/typing/:userId
+ * Set typing status for a conversation
+ */
+router.post('/typing/:userId', authenticateToken, async (req: Request, res: Response) => {
+  try {
+    const currentUserId = req.user!.id;
+    const otherUserId = req.params.userId;
+
+    if (!otherUserId) {
+      return res.status(400).json({ message: 'User ID is required' });
+    }
+
+    // Store typing status (current user is typing to other user)
+    if (!typingStatus.has(otherUserId)) {
+      typingStatus.set(otherUserId, new Map());
+    }
+    const userTypingMap = typingStatus.get(otherUserId)!;
+    userTypingMap.set(currentUserId, Date.now());
+
+    return res.json({ success: true });
+  } catch (err) {
+    console.error('Set typing status error', err);
+    return res.status(500).json({ message: 'Internal server error' });
+  }
+});
+
+/**
+ * GET /messages/typing/:userId
+ * Get typing status for a conversation
+ */
+router.get('/typing/:userId', authenticateToken, async (req: Request, res: Response) => {
+  try {
+    const currentUserId = req.user!.id;
+    const otherUserId = req.params.userId;
+
+    if (!otherUserId) {
+      return res.status(400).json({ message: 'User ID is required' });
+    }
+
+    // Check if other user is typing to current user
+    const userTypingMap = typingStatus.get(currentUserId);
+    const isTyping = userTypingMap?.has(otherUserId) ?? false;
+    const typingTimestamp = userTypingMap?.get(otherUserId) ?? 0;
+
+    // Only return true if typing status is recent (within last 3 seconds)
+    const now = Date.now();
+    const isRecentlyTyping = isTyping && (now - typingTimestamp) < 3000;
+
+    return res.json({ isTyping: isRecentlyTyping });
+  } catch (err) {
+    console.error('Get typing status error', err);
+    return res.status(500).json({ message: 'Internal server error' });
+  }
+});
+
+/**
+ * POST /messages/typing/:userId
+ * Indicate that the current user is typing to another user
+ */
+router.post('/typing/:userId', authenticateToken, async (req: Request, res: Response) => {
+  try {
+    const currentUserId = req.user!.id;
+    const recipientId = req.params.userId;
+
+    // Store typing status: recipientId -> { currentUserId: timestamp }
+    if (!typingStatus.has(recipientId)) {
+      typingStatus.set(recipientId, new Map());
+    }
+    const userMap = typingStatus.get(recipientId)!;
+    userMap.set(currentUserId, Date.now());
+
+    return res.json({ success: true });
+  } catch (err) {
+    console.error('Set typing status error', err);
+    return res.status(500).json({ message: 'Internal server error' });
+  }
+});
+
+/**
+ * GET /messages/typing/:userId
+ * Check if the other user is typing
+ */
+router.get('/typing/:userId', authenticateToken, async (req: Request, res: Response) => {
+  try {
+    const currentUserId = req.user!.id;
+    const otherUserId = req.params.userId;
+
+    // Check if other user is typing to current user
+    const userMap = typingStatus.get(currentUserId);
+    if (!userMap) {
+      return res.json({ isTyping: false });
+    }
+
+    const typingTimestamp = userMap.get(otherUserId);
+    if (!typingTimestamp) {
+      return res.json({ isTyping: false });
+    }
+
+    // Check if typing status is still fresh (within last 3 seconds)
+    const now = Date.now();
+    const isTyping = now - typingTimestamp < 3000;
+
+    return res.json({ isTyping });
+  } catch (err) {
+    console.error('Get typing status error', err);
     return res.status(500).json({ message: 'Internal server error' });
   }
 });
