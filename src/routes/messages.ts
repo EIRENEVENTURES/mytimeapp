@@ -2,8 +2,20 @@
 import { Router, Request, Response } from 'express';
 import { authenticateToken } from '../middleware/auth';
 import { pool } from '../db';
+import { writeFile, mkdir } from 'fs/promises';
+import { join } from 'path';
+import { existsSync } from 'fs';
 
 const router = Router();
+
+// Ensure uploads directory exists
+const UPLOADS_DIR = join(__dirname, '..', '..', 'uploads');
+const ensureUploadsDir = async () => {
+  if (!existsSync(UPLOADS_DIR)) {
+    await mkdir(UPLOADS_DIR, { recursive: true });
+  }
+};
+ensureUploadsDir();
 
 /**
  * GET /messages/conversation/:userId
@@ -158,6 +170,187 @@ router.get('/user/:userId', authenticateToken, async (req: Request, res: Respons
     });
   } catch (err) {
     console.error('Get user error', err);
+    return res.status(500).json({ message: 'Internal server error' });
+  }
+});
+
+/**
+ * POST /messages/upload
+ * Upload a file attachment (image, video, audio, document, etc.)
+ */
+router.post('/upload', authenticateToken, async (req: Request, res: Response) => {
+  try {
+    const senderId = req.user!.id;
+    const { recipientId, fileData, fileName, mimeType, type, metadata, thumbnailUrl } = req.body;
+
+    if (!recipientId || !fileData || !fileName || !type) {
+      return res.status(400).json({ message: 'Recipient ID, file data, file name, and type are required' });
+    }
+
+    // Verify recipient exists
+    const recipientCheck = await pool.query('SELECT id FROM users WHERE id = $1', [recipientId]);
+    if (recipientCheck.rows.length === 0) {
+      return res.status(404).json({ message: 'Recipient not found' });
+    }
+
+    // Validate type
+    const validTypes = ['media', 'link', 'document', 'contact', 'audio', 'video', 'image'];
+    if (!validTypes.includes(type)) {
+      return res.status(400).json({ message: 'Invalid attachment type' });
+    }
+
+    // Generate unique filename
+    const fileExt = fileName.split('.').pop() || '';
+    const uniqueFileName = `${Date.now()}-${Math.random().toString(36).substring(7)}.${fileExt}`;
+    const filePath = join(UPLOADS_DIR, uniqueFileName);
+
+    // Handle base64 file data
+    let fileBuffer: Buffer;
+    if (fileData.startsWith('data:')) {
+      // Base64 with data URI prefix
+      const base64Data = fileData.split(',')[1];
+      fileBuffer = Buffer.from(base64Data, 'base64');
+    } else {
+      // Plain base64
+      fileBuffer = Buffer.from(fileData, 'base64');
+    }
+
+    // Save file
+    await writeFile(filePath, fileBuffer);
+
+    // Get file size
+    const fileSize = fileBuffer.length;
+
+    // Create file URL (in production, this would be a CDN URL)
+    const fileUrl = `/uploads/${uniqueFileName}`;
+
+    // Create message with attachment
+    const { rows: messageRows } = await pool.query(
+      `INSERT INTO messages (sender_id, recipient_id, content, status, has_attachments)
+       VALUES ($1, $2, $3, 'sent', TRUE)
+       RETURNING id, sender_id, recipient_id, content, status, created_at`,
+      [senderId, recipientId, fileName], // Use filename as content placeholder
+    );
+
+    const message = messageRows[0];
+
+    // Handle thumbnail if provided
+    let thumbnailFileUrl = null;
+    if (thumbnailUrl && type === 'video') {
+      const thumbnailBase64 = thumbnailUrl.includes(',') ? thumbnailUrl.split(',')[1] : thumbnailUrl;
+      const thumbnailBuffer = Buffer.from(thumbnailBase64, 'base64');
+      const thumbnailFileName = `thumb-${Date.now()}-${Math.random().toString(36).substring(7)}.jpg`;
+      const thumbnailPath = join(UPLOADS_DIR, thumbnailFileName);
+      await writeFile(thumbnailPath, thumbnailBuffer);
+      thumbnailFileUrl = `/uploads/${thumbnailFileName}`;
+    }
+
+    // Create attachment record
+    const { rows: attachmentRows } = await pool.query(
+      `INSERT INTO message_attachments (
+        message_id, type, file_name, file_url, file_size, mime_type, thumbnail_url, metadata
+       )
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+       RETURNING id, type, file_name, file_url, file_size, mime_type, thumbnail_url, metadata, created_at`,
+      [
+        message.id,
+        type,
+        fileName,
+        fileUrl,
+        fileSize,
+        mimeType || null,
+        thumbnailFileUrl,
+        metadata ? JSON.stringify(metadata) : null,
+      ],
+    );
+
+    // Mark as delivered
+    await pool.query(`UPDATE messages SET status = 'delivered' WHERE id = $1`, [message.id]);
+
+    return res.json({
+      message: {
+        id: message.id,
+        senderId: message.sender_id,
+        recipientId: message.recipient_id,
+        content: message.content,
+        status: 'delivered',
+        createdAt: message.created_at,
+        attachment: {
+          id: attachmentRows[0].id,
+          type: attachmentRows[0].type,
+          fileName: attachmentRows[0].file_name,
+          fileUrl: attachmentRows[0].file_url,
+          fileSize: attachmentRows[0].file_size,
+          mimeType: attachmentRows[0].mime_type,
+          thumbnailUrl: attachmentRows[0].thumbnail_url,
+          metadata: attachmentRows[0].metadata,
+          createdAt: attachmentRows[0].created_at,
+        },
+      },
+    });
+  } catch (err) {
+    console.error('Upload file error', err);
+    return res.status(500).json({ message: 'Internal server error' });
+  }
+});
+
+/**
+ * GET /messages/attachments/:userId
+ * Get all attachments (media, links, docs) for a conversation
+ */
+router.get('/attachments/:userId', authenticateToken, async (req: Request, res: Response) => {
+  try {
+    const currentUserId = req.user!.id;
+    const otherUserId = req.params.userId;
+    const { type } = req.query; // Optional filter: 'media', 'link', 'document', etc.
+
+    let query = `
+      SELECT 
+        ma.id,
+        ma.type,
+        ma.file_name,
+        ma.file_url,
+        ma.file_size,
+        ma.mime_type,
+        ma.thumbnail_url,
+        ma.metadata,
+        ma.created_at,
+        m.sender_id,
+        m.recipient_id
+      FROM message_attachments ma
+      INNER JOIN messages m ON ma.message_id = m.id
+      WHERE (m.sender_id = $1 AND m.recipient_id = $2)
+         OR (m.sender_id = $2 AND m.recipient_id = $1)
+    `;
+
+    const params: any[] = [currentUserId, otherUserId];
+
+    if (type && typeof type === 'string') {
+      query += ` AND ma.type = $3`;
+      params.push(type);
+    }
+
+    query += ` ORDER BY ma.created_at DESC`;
+
+    const { rows } = await pool.query(query, params);
+
+    return res.json({
+      attachments: rows.map((row) => ({
+        id: row.id,
+        type: row.type,
+        fileName: row.file_name,
+        fileUrl: row.file_url,
+        fileSize: row.file_size,
+        mimeType: row.mime_type,
+        thumbnailUrl: row.thumbnail_url,
+        metadata: row.metadata,
+        createdAt: row.created_at,
+        senderId: row.sender_id,
+        recipientId: row.recipient_id,
+      })),
+    });
+  } catch (err) {
+    console.error('Get attachments error', err);
     return res.status(500).json({ message: 'Internal server error' });
   }
 });
