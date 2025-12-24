@@ -46,7 +46,18 @@ router.get('/conversation/:userId', authenticateToken, async (req: Request, res:
     const currentUserId = req.user!.id;
     const otherUserId = req.params.userId;
 
-    // Mark messages as read (messages sent to current user from other user)
+    // First, mark any "sent" messages as "delivered" when user views conversation
+    // (This handles the case where user was offline when message was sent)
+    await pool.query(
+      `UPDATE messages 
+       SET status = 'delivered' 
+       WHERE recipient_id = $1 
+         AND sender_id = $2 
+         AND status = 'sent'`,
+      [currentUserId, otherUserId],
+    );
+
+    // Then mark messages as read (messages sent to current user from other user)
     await pool.query(
       `UPDATE messages 
        SET status = 'read' 
@@ -100,43 +111,49 @@ router.post('/', authenticateToken, async (req: Request, res: Response) => {
       return res.status(400).json({ message: 'Recipient ID and content are required' });
     }
 
-    // Verify recipient exists
-    const recipientCheck = await pool.query('SELECT id FROM users WHERE id = $1', [recipientId]);
+    // Check if recipient is online (active within last 2 minutes)
+    const recipientCheck = await pool.query(
+      `SELECT id, last_seen_at FROM users WHERE id = $1`,
+      [recipientId]
+    );
+    
     if (recipientCheck.rows.length === 0) {
       return res.status(404).json({ message: 'Recipient not found' });
     }
 
-    // Insert message
+    const recipient = recipientCheck.rows[0];
+    let initialStatus = 'sent'; // Default to sent for offline users
+    
+    // Check if recipient is online (active within last 2 minutes)
+    if (recipient.last_seen_at) {
+      const lastSeen = new Date(recipient.last_seen_at as Date).getTime();
+      const now = Date.now();
+      const diffMinutes = (now - lastSeen) / (1000 * 60);
+      
+      if (diffMinutes <= 2) {
+        // Recipient is online, mark as delivered
+        initialStatus = 'delivered';
+      }
+    }
+
+    // Insert message with appropriate status
     const { rows } = await pool.query(
       `INSERT INTO messages (sender_id, recipient_id, content, status)
-       VALUES ($1, $2, $3, 'sent')
+       VALUES ($1, $2, $3, $4)
        RETURNING id, sender_id, recipient_id, content, status, created_at`,
-      [senderId, recipientId, content.trim()],
+      [senderId, recipientId, content.trim(), initialStatus],
     );
 
     const message = rows[0];
 
-    // Mark as delivered immediately (in real app, this would be done via push notification)
-    await pool.query(
-      `UPDATE messages SET status = 'delivered' WHERE id = $1`,
-      [message.id],
-    );
-
-    // Return updated message
-    const { rows: updatedRows } = await pool.query(
-      `SELECT id, sender_id, recipient_id, content, status, created_at
-       FROM messages WHERE id = $1`,
-      [message.id],
-    );
-
     return res.json({
       message: {
-        id: updatedRows[0].id,
-        senderId: updatedRows[0].sender_id,
-        recipientId: updatedRows[0].recipient_id,
-        content: updatedRows[0].content,
-        status: updatedRows[0].status,
-        createdAt: updatedRows[0].created_at,
+        id: message.id,
+        senderId: message.sender_id,
+        recipientId: message.recipient_id,
+        content: message.content,
+        status: message.status,
+        createdAt: message.created_at,
       },
     });
   } catch (err) {
@@ -254,12 +271,37 @@ router.post('/upload', authenticateToken, async (req: Request, res: Response) =>
     // Create file URL (in production, this would be a CDN URL)
     const fileUrl = `/uploads/${uniqueFileName}`;
 
+    // Check if recipient is online (active within last 2 minutes)
+    const recipientCheck = await pool.query(
+      `SELECT id, last_seen_at FROM users WHERE id = $1`,
+      [recipientId]
+    );
+    
+    if (recipientCheck.rows.length === 0) {
+      return res.status(404).json({ message: 'Recipient not found' });
+    }
+
+    const recipient = recipientCheck.rows[0];
+    let initialStatus = 'sent'; // Default to sent for offline users
+    
+    // Check if recipient is online (active within last 2 minutes)
+    if (recipient.last_seen_at) {
+      const lastSeen = new Date(recipient.last_seen_at as Date).getTime();
+      const now = Date.now();
+      const diffMinutes = (now - lastSeen) / (1000 * 60);
+      
+      if (diffMinutes <= 2) {
+        // Recipient is online, mark as delivered
+        initialStatus = 'delivered';
+      }
+    }
+
     // Create message with attachment
     const { rows: messageRows } = await pool.query(
       `INSERT INTO messages (sender_id, recipient_id, content, status, has_attachments)
-       VALUES ($1, $2, $3, 'sent', TRUE)
+       VALUES ($1, $2, $3, $4, TRUE)
        RETURNING id, sender_id, recipient_id, content, status, created_at`,
-      [senderId, recipientId, fileName], // Use filename as content placeholder
+      [senderId, recipientId, fileName, initialStatus], // Use filename as content placeholder
     );
 
     const message = messageRows[0];
@@ -294,16 +336,13 @@ router.post('/upload', authenticateToken, async (req: Request, res: Response) =>
       ],
     );
 
-    // Mark as delivered
-    await pool.query(`UPDATE messages SET status = 'delivered' WHERE id = $1`, [message.id]);
-
     return res.json({
       message: {
         id: message.id,
         senderId: message.sender_id,
         recipientId: message.recipient_id,
         content: message.content,
-        status: 'delivered',
+        status: message.status,
         createdAt: message.created_at,
         attachment: {
           id: attachmentRows[0].id,
@@ -357,7 +396,7 @@ router.get('/chats', authenticateToken, async (req: Request, res: Response) => {
   try {
     const currentUserId = req.user!.id;
 
-    // Get all unique conversations (users the current user has messaged or received messages from)
+    // Optimized query using window functions for better performance
     const { rows } = await pool.query(
       `WITH conversation_partners AS (
         SELECT DISTINCT
@@ -368,24 +407,38 @@ router.get('/chats', authenticateToken, async (req: Request, res: Response) => {
         FROM messages
         WHERE sender_id = $1 OR recipient_id = $1
       ),
+      ranked_messages AS (
+        SELECT 
+          CASE 
+            WHEN sender_id = $1 THEN recipient_id
+            ELSE sender_id
+          END as partner_id,
+          id,
+          content,
+          status,
+          created_at,
+          sender_id,
+          ROW_NUMBER() OVER (
+            PARTITION BY 
+              CASE 
+                WHEN sender_id = $1 THEN recipient_id
+                ELSE sender_id
+              END
+            ORDER BY created_at DESC
+          ) as rn
+        FROM messages
+        WHERE sender_id = $1 OR recipient_id = $1
+      ),
       last_messages AS (
-        SELECT DISTINCT ON (partner_id)
+        SELECT 
           partner_id,
-          m.id as message_id,
-          m.content,
-          m.status,
-          m.created_at,
-          m.sender_id
-        FROM conversation_partners cp
-        CROSS JOIN LATERAL (
-          SELECT id, content, status, created_at, sender_id
-          FROM messages
-          WHERE (sender_id = $1 AND recipient_id = cp.partner_id)
-             OR (sender_id = cp.partner_id AND recipient_id = $1)
-          ORDER BY created_at DESC
-          LIMIT 1
-        ) m
-        ORDER BY partner_id, m.created_at DESC
+          id as message_id,
+          content,
+          status,
+          created_at,
+          sender_id
+        FROM ranked_messages
+        WHERE rn = 1
       ),
       unread_counts AS (
         SELECT 
@@ -413,7 +466,7 @@ router.get('/chats', authenticateToken, async (req: Request, res: Response) => {
       LEFT JOIN last_messages lm ON lm.partner_id = cp.partner_id
       LEFT JOIN unread_counts uc ON uc.partner_id = cp.partner_id
       WHERE u.is_active = TRUE
-      ORDER BY lm.created_at DESC NULLS LAST`,
+      ORDER BY COALESCE(lm.created_at, '1970-01-01'::timestamptz) DESC`,
       [currentUserId],
     );
 
