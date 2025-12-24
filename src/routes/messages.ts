@@ -331,6 +331,94 @@ router.get('/unread-count', authenticateToken, async (req: Request, res: Respons
 });
 
 /**
+ * GET /messages/chats
+ * Get list of all conversations with last message, time, and unread count
+ */
+router.get('/chats', authenticateToken, async (req: Request, res: Response) => {
+  try {
+    const currentUserId = req.user!.id;
+
+    // Get all unique conversations (users the current user has messaged or received messages from)
+    const { rows } = await pool.query(
+      `WITH conversation_partners AS (
+        SELECT DISTINCT
+          CASE 
+            WHEN sender_id = $1 THEN recipient_id
+            ELSE sender_id
+          END as partner_id
+        FROM messages
+        WHERE sender_id = $1 OR recipient_id = $1
+      ),
+      last_messages AS (
+        SELECT DISTINCT ON (partner_id)
+          partner_id,
+          m.id as message_id,
+          m.content,
+          m.status,
+          m.created_at,
+          m.sender_id
+        FROM conversation_partners cp
+        CROSS JOIN LATERAL (
+          SELECT id, content, status, created_at, sender_id
+          FROM messages
+          WHERE (sender_id = $1 AND recipient_id = cp.partner_id)
+             OR (sender_id = cp.partner_id AND recipient_id = $1)
+          ORDER BY created_at DESC
+          LIMIT 1
+        ) m
+        ORDER BY partner_id, m.created_at DESC
+      ),
+      unread_counts AS (
+        SELECT 
+          CASE 
+            WHEN sender_id = $1 THEN recipient_id
+            ELSE sender_id
+          END as partner_id,
+          COUNT(*) as unread_count
+        FROM messages
+        WHERE recipient_id = $1
+          AND status != 'read'
+        GROUP BY partner_id
+      )
+      SELECT 
+        u.id as user_id,
+        u.display_name,
+        u.username,
+        lm.content as last_message,
+        lm.created_at as last_message_time,
+        lm.status as last_message_status,
+        lm.sender_id = $1 as is_last_message_from_me,
+        COALESCE(uc.unread_count, 0)::int as unread_count
+      FROM conversation_partners cp
+      INNER JOIN users u ON u.id = cp.partner_id
+      LEFT JOIN last_messages lm ON lm.partner_id = cp.partner_id
+      LEFT JOIN unread_counts uc ON uc.partner_id = cp.partner_id
+      WHERE u.is_active = TRUE
+      ORDER BY lm.created_at DESC NULLS LAST`,
+      [currentUserId],
+    );
+
+    return res.json({
+      chats: rows.map((row) => ({
+        id: row.user_id,
+        userId: row.user_id,
+        userName: row.display_name || row.username || 'Unknown',
+        userAvatar: null, // Profile pictures are stored locally on mobile, not in DB
+        lastMessage: row.last_message,
+        lastMessageTime: row.last_message_time,
+        lastMessageStatus: row.is_last_message_from_me ? row.last_message_status : undefined,
+        unreadCount: row.unread_count || 0,
+        isPinned: false, // TODO: Add pinning functionality
+        isStarred: false, // TODO: Add starring functionality
+      })),
+    });
+  } catch (err) {
+    console.error('Get chats error', err);
+    return res.status(500).json({ message: 'Internal server error' });
+  }
+});
+
+/**
  * GET /messages/attachments/:userId
  * Get all attachments (media, links, docs) for a conversation
  */
