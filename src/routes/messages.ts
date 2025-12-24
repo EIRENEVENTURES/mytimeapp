@@ -20,11 +20,22 @@ ensureUploadsDir();
 /**
  * GET /messages/conversation/:userId
  * Get conversation messages between current user and another user
+ * Also marks messages as read when the conversation is viewed
  */
 router.get('/conversation/:userId', authenticateToken, async (req: Request, res: Response) => {
   try {
     const currentUserId = req.user!.id;
     const otherUserId = req.params.userId;
+
+    // Mark messages as read (messages sent to current user from other user)
+    await pool.query(
+      `UPDATE messages 
+       SET status = 'read' 
+       WHERE recipient_id = $1 
+         AND sender_id = $2 
+         AND status != 'read'`,
+      [currentUserId, otherUserId],
+    );
 
     const { rows } = await pool.query(
       `SELECT 
@@ -290,6 +301,31 @@ router.post('/upload', authenticateToken, async (req: Request, res: Response) =>
     });
   } catch (err) {
     console.error('Upload file error', err);
+    return res.status(500).json({ message: 'Internal server error' });
+  }
+});
+
+/**
+ * GET /messages/unread-count
+ * Get total count of unread messages for the current user
+ */
+router.get('/unread-count', authenticateToken, async (req: Request, res: Response) => {
+  try {
+    const currentUserId = req.user!.id;
+
+    const { rows } = await pool.query(
+      `SELECT COUNT(*) as unread_count
+       FROM messages
+       WHERE recipient_id = $1
+         AND status != 'read'`,
+      [currentUserId],
+    );
+
+    const unreadCount = parseInt(rows[0].unread_count, 10) || 0;
+
+    return res.json({ unreadCount });
+  } catch (err) {
+    console.error('Get unread count error', err);
     return res.status(500).json({ message: 'Internal server error' });
   }
 });
