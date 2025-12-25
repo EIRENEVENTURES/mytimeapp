@@ -833,6 +833,7 @@ router.post('/:messageId/star', authenticateToken, async (req: Request, res: Res
 /**
  * POST /messages/:messageId/reaction
  * Add or remove a reaction to a message
+ * Note: This route must come after /:messageId/star to avoid route conflicts
  */
 router.post('/:messageId/reaction', authenticateToken, async (req: Request, res: Response) => {
   try {
