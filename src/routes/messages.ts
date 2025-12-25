@@ -352,12 +352,6 @@ router.post('/upload', authenticateToken, async (req: Request, res: Response) =>
       return res.status(400).json({ message: 'Recipient ID, file data, file name, and type are required' });
     }
 
-    // Verify recipient exists
-    const recipientCheck = await pool.query('SELECT id FROM users WHERE id = $1', [recipientId]);
-    if (recipientCheck.rows.length === 0) {
-      return res.status(404).json({ message: 'Recipient not found' });
-    }
-
     // Validate type
     const validTypes = ['media', 'link', 'document', 'contact', 'audio', 'video', 'image'];
     if (!validTypes.includes(type)) {
@@ -389,7 +383,7 @@ router.post('/upload', authenticateToken, async (req: Request, res: Response) =>
     // Create file URL (in production, this would be a CDN URL)
     const fileUrl = `/uploads/${uniqueFileName}`;
 
-    // Check if recipient is online (active within last 2 minutes)
+    // Check if recipient exists and is online (active within last 2 minutes)
     const recipientCheck = await pool.query(
       `SELECT id, last_seen_at FROM users WHERE id = $1`,
       [recipientId]
