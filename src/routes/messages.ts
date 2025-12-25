@@ -223,7 +223,7 @@ router.get('/conversation/:userId', authenticateToken, async (req: Request, res:
 router.post('/', authenticateToken, async (req: Request, res: Response) => {
   try {
     const senderId = req.user!.id;
-    const { recipientId, content } = req.body;
+    const { recipientId, content, replyToMessageId } = req.body;
 
     if (!recipientId || !content || !content.trim()) {
       return res.status(400).json({ message: 'Recipient ID and content are required' });
@@ -256,10 +256,10 @@ router.post('/', authenticateToken, async (req: Request, res: Response) => {
 
     // Insert message with appropriate status
     const { rows } = await pool.query(
-      `INSERT INTO messages (sender_id, recipient_id, content, status)
-       VALUES ($1, $2, $3, $4)
-       RETURNING id, sender_id, recipient_id, content, status, created_at`,
-      [senderId, recipientId, content.trim(), initialStatus],
+      `INSERT INTO messages (sender_id, recipient_id, content, status, reply_to_message_id)
+       VALUES ($1, $2, $3, $4, $5)
+       RETURNING id, sender_id, recipient_id, content, status, created_at, reply_to_message_id`,
+      [senderId, recipientId, content.trim(), initialStatus, replyToMessageId || null],
     );
 
     const message = rows[0];
@@ -272,6 +272,7 @@ router.post('/', authenticateToken, async (req: Request, res: Response) => {
         content: message.content,
         status: message.status,
         createdAt: message.created_at,
+        replyToMessageId: message.reply_to_message_id,
       },
     });
   } catch (err) {
@@ -851,23 +852,36 @@ router.post('/:messageId/reaction', authenticateToken, async (req: Request, res:
       return res.status(404).json({ message: 'Message not found' });
     }
 
-    // Check if reaction already exists
-    const { rows: reactionRows } = await pool.query(
-      `SELECT id FROM message_reactions 
-       WHERE message_id = $1 AND user_id = $2 AND emoji = $3`,
-      [messageId, currentUserId, emoji],
+    // Check if user already has a reaction on this message (any emoji)
+    const { rows: existingReactionRows } = await pool.query(
+      `SELECT id, emoji FROM message_reactions 
+       WHERE message_id = $1 AND user_id = $2`,
+      [messageId, currentUserId],
     );
 
-    if (reactionRows.length > 0) {
-      // Remove reaction
-      await pool.query(
-        `DELETE FROM message_reactions 
-         WHERE message_id = $1 AND user_id = $2 AND emoji = $3`,
-        [messageId, currentUserId, emoji],
-      );
-      return res.json({ added: false });
+    if (existingReactionRows.length > 0) {
+      const existingEmoji = existingReactionRows[0].emoji;
+      
+      if (existingEmoji === emoji) {
+        // Same emoji - remove reaction (toggle off)
+        await pool.query(
+          `DELETE FROM message_reactions 
+           WHERE message_id = $1 AND user_id = $2 AND emoji = $3`,
+          [messageId, currentUserId, emoji],
+        );
+        return res.json({ added: false });
+      } else {
+        // Different emoji - replace existing reaction
+        await pool.query(
+          `UPDATE message_reactions 
+           SET emoji = $3 
+           WHERE message_id = $1 AND user_id = $2`,
+          [messageId, currentUserId, emoji],
+        );
+        return res.json({ added: true, replaced: true });
+      }
     } else {
-      // Add reaction
+      // No existing reaction - add new one
       await pool.query(
         `INSERT INTO message_reactions (message_id, user_id, emoji) 
          VALUES ($1, $2, $3)`,
