@@ -895,5 +895,152 @@ router.post('/:messageId/reaction', authenticateToken, async (req: Request, res:
   }
 });
 
+/**
+ * POST /messages/forward
+ * Forward one or more messages to a recipient
+ */
+router.post('/forward', authenticateToken, async (req: Request, res: Response) => {
+  try {
+    const senderId = req.user!.id;
+    const { messageIds, recipientId } = req.body;
+
+    if (!messageIds || !Array.isArray(messageIds) || messageIds.length === 0) {
+      return res.status(400).json({ message: 'Message IDs array is required' });
+    }
+
+    if (!recipientId) {
+      return res.status(400).json({ message: 'Recipient ID is required' });
+    }
+
+    // Check if recipient exists
+    const recipientCheck = await pool.query(
+      `SELECT id, last_seen_at FROM users WHERE id = $1`,
+      [recipientId]
+    );
+    
+    if (recipientCheck.rows.length === 0) {
+      return res.status(404).json({ message: 'Recipient not found' });
+    }
+
+    const recipient = recipientCheck.rows[0];
+    let initialStatus = 'sent';
+    
+    // Check if recipient is online (active within last 2 minutes)
+    if (recipient.last_seen_at) {
+      const lastSeen = new Date(recipient.last_seen_at as Date).getTime();
+      const now = Date.now();
+      const diffMinutes = (now - lastSeen) / (1000 * 60);
+      
+      if (diffMinutes <= 2) {
+        initialStatus = 'delivered';
+      }
+    }
+
+    // Get the original messages to forward
+    const { rows: originalMessages } = await pool.query(
+      `SELECT m.id, m.content, m.reply_to_message_id, m.has_attachments,
+              a.id as attachment_id, a.type, a.file_name, a.file_url, a.file_size, 
+              a.mime_type, a.thumbnail_url, a.metadata
+       FROM messages m
+       LEFT JOIN message_attachments a ON m.id = a.message_id
+       WHERE m.id = ANY($1::uuid[])
+       ORDER BY m.created_at ASC`,
+      [messageIds]
+    );
+
+    if (originalMessages.length === 0) {
+      return res.status(404).json({ message: 'No messages found to forward' });
+    }
+
+    // Group messages by message ID to handle attachments
+    const messagesMap = new Map();
+    originalMessages.forEach((row) => {
+      if (!messagesMap.has(row.id)) {
+        messagesMap.set(row.id, {
+          id: row.id,
+          content: row.content,
+          replyToMessageId: row.reply_to_message_id,
+          hasAttachments: row.has_attachments,
+          attachments: [],
+        });
+      }
+      if (row.attachment_id) {
+        messagesMap.get(row.id).attachments.push({
+          id: row.attachment_id,
+          type: row.type,
+          fileName: row.file_name,
+          fileUrl: row.file_url,
+          fileSize: row.file_size,
+          mimeType: row.mime_type,
+          thumbnailUrl: row.thumbnail_url,
+          metadata: row.metadata,
+        });
+      }
+    });
+
+    const messagesToForward = Array.from(messagesMap.values());
+    const forwardedMessages = [];
+
+    // Forward each message
+    for (const originalMessage of messagesToForward) {
+      // Create new message with forwarded content
+      const { rows: newMessageRows } = await pool.query(
+        `INSERT INTO messages (sender_id, recipient_id, content, status, reply_to_message_id, has_attachments)
+         VALUES ($1, $2, $3, $4, NULL, $5)
+         RETURNING id, sender_id, recipient_id, content, status, created_at, reply_to_message_id`,
+        [
+          senderId,
+          recipientId,
+          originalMessage.content,
+          initialStatus,
+          originalMessage.hasAttachments || false,
+        ]
+      );
+
+      const newMessage = newMessageRows[0];
+
+      // Forward attachments if any
+      if (originalMessage.attachments.length > 0) {
+        for (const attachment of originalMessage.attachments) {
+          await pool.query(
+            `INSERT INTO message_attachments 
+             (message_id, type, file_name, file_url, file_size, mime_type, thumbnail_url, metadata)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+            [
+              newMessage.id,
+              attachment.type,
+              attachment.fileName,
+              attachment.fileUrl,
+              attachment.fileSize,
+              attachment.mimeType,
+              attachment.thumbnailUrl,
+              attachment.metadata ? JSON.stringify(attachment.metadata) : null,
+            ]
+          );
+        }
+      }
+
+      forwardedMessages.push({
+        id: newMessage.id,
+        senderId: newMessage.sender_id,
+        recipientId: newMessage.recipient_id,
+        content: newMessage.content,
+        status: newMessage.status,
+        createdAt: newMessage.created_at,
+        replyToMessageId: newMessage.reply_to_message_id,
+      });
+    }
+
+    return res.json({
+      success: true,
+      messages: forwardedMessages,
+      count: forwardedMessages.length,
+    });
+  } catch (err) {
+    console.error('Forward messages error', err);
+    return res.status(500).json({ message: 'Internal server error' });
+  }
+});
+
 export default router;
 
