@@ -8,14 +8,43 @@ import { existsSync } from 'fs';
 
 const UPLOADS_DIR = join(__dirname, '..', '..', 'uploads');
 
-// File size limits (in bytes)
+// WhatsApp-standard file size limits (in bytes) - HARD GATES
 export const FILE_SIZE_LIMITS = {
-  image: 5 * 1024 * 1024, // 5MB
-  video: 50 * 1024 * 1024, // 50MB
-  audio: 20 * 1024 * 1024, // 20MB
-  document: 10 * 1024 * 1024, // 10MB
-  default: 5 * 1024 * 1024, // 5MB default
+  image: {
+    soft: 5 * 1024 * 1024, // 5MB - soft compress
+    hard: 10 * 1024 * 1024, // 10MB - hard limit (reject if larger)
+  },
+  video: {
+    hard: 2 * 1024 * 1024 * 1024, // 2GB - hard limit
+  },
+  audio: {
+    hard: 100 * 1024 * 1024, // 100MB - hard limit
+  },
+  document: {
+    hard: 2 * 1024 * 1024 * 1024, // 2GB - hard limit
+  },
+  thumbnail: {
+    hard: 10 * 1024, // 10KB - mandatory max for thumbnails
+  },
+  default: {
+    hard: 5 * 1024 * 1024, // 5MB default
+  },
 };
+
+// Get hard limit for file type (for rejection before upload)
+export function getHardLimit(fileType: string): number {
+  const limits = FILE_SIZE_LIMITS[fileType as keyof typeof FILE_SIZE_LIMITS];
+  if (!limits) return FILE_SIZE_LIMITS.default.hard;
+  if ('hard' in limits) return limits.hard;
+  return FILE_SIZE_LIMITS.default.hard;
+}
+
+// Get soft limit for file type (for compression threshold)
+export function getSoftLimit(fileType: string): number | null {
+  const limits = FILE_SIZE_LIMITS[fileType as keyof typeof FILE_SIZE_LIMITS];
+  if (!limits || !('soft' in limits)) return null;
+  return limits.soft;
+}
 
 // Allowed MIME types
 export const ALLOWED_MIME_TYPES = {
@@ -26,23 +55,49 @@ export const ALLOWED_MIME_TYPES = {
 };
 
 /**
+ * Validate file before upload (HARD GATE - reject if invalid)
+ * This must be called BEFORE any upload starts
+ */
+export function validateFileBeforeUpload(
+  fileSize: number,
+  mimeType?: string,
+): { valid: boolean; error?: string } {
+  const fileType = getFileType(mimeType);
+  const hardLimit = getHardLimit(fileType);
+
+  // HARD GATE: Reject oversized files immediately
+  if (fileSize > hardLimit) {
+    const limitMB = (hardLimit / (1024 * 1024)).toFixed(1);
+    return {
+      valid: false,
+      error: `File size (${(fileSize / (1024 * 1024)).toFixed(1)}MB) exceeds maximum limit of ${limitMB}MB for ${fileType} files`,
+    };
+  }
+
+  // Validate MIME type if provided
+  if (mimeType && !isAllowedMimeType(mimeType, fileType)) {
+    return {
+      valid: false,
+      error: `File type ${mimeType} is not allowed for ${fileType} files`,
+    };
+  }
+
+  return { valid: true };
+}
+
+/**
  * Upload file to blob storage or local filesystem
+ * NOTE: File should be validated with validateFileBeforeUpload() first
  */
 export async function uploadFile(
   fileName: string,
   fileBuffer: Buffer,
   mimeType?: string,
 ): Promise<string> {
-  // Validate file size
-  const fileType = getFileType(mimeType);
-  const maxSize = FILE_SIZE_LIMITS[fileType] || FILE_SIZE_LIMITS.default;
-  if (fileBuffer.length > maxSize) {
-    throw new Error(`File size exceeds limit of ${maxSize / (1024 * 1024)}MB`);
-  }
-
-  // Validate MIME type if provided
-  if (mimeType && !isAllowedMimeType(mimeType, fileType)) {
-    throw new Error(`File type ${mimeType} is not allowed for ${fileType}`);
+  // Double-check validation (safety net)
+  const validation = validateFileBeforeUpload(fileBuffer.length, mimeType);
+  if (!validation.valid) {
+    throw new Error(validation.error || 'File validation failed');
   }
 
   const useBlobStorage = process.env.USE_BLOB_STORAGE === 'true';

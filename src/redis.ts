@@ -99,6 +99,15 @@ export async function getTypingUsers(recipientId: string): Promise<string[]> {
   return keys.map((key) => key.split(':')[2]);
 }
 
+export async function getTypingStatus(userId: string, recipientId: string): Promise<boolean> {
+  const client = getRedisClient();
+  if (!client) return false;
+
+  const key = `typing:${recipientId}:${userId}`;
+  const result = await client.get(key);
+  return result === '1';
+}
+
 /**
  * Unread counter management
  */

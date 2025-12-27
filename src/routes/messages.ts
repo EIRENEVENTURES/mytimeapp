@@ -136,13 +136,15 @@ router.get('/conversation/:userId', authenticateToken, async (req: Request, res:
     // Reverse to get chronological order (oldest first)
     messages.reverse();
 
-    // Optimized: Batch fetch all related data in parallel (reduces latency)
+    // FAST PATH: Only fetch attachments for messages that have the flag (index-only check)
     const messageIds = messages.map((r) => r.id);
+    const messagesWithAttachments = messages.filter((m) => m.has_attachments);
+    const attachmentMessageIds = messagesWithAttachments.map((m) => m.id);
     
-    // Parallel queries for better performance
+    // Parallel queries for better performance (only fetch what we need)
     const [attachmentsResult, reactionsResult, starredResult, pinnedResult] = await Promise.all([
-      // Get attachments (only if messages have attachments flag)
-      messageIds.length > 0
+      // Get attachments (only for messages with has_attachments flag - avoids unnecessary joins)
+      attachmentMessageIds.length > 0
         ? pool.query(
             `SELECT 
               message_id,
@@ -157,7 +159,7 @@ router.get('/conversation/:userId', authenticateToken, async (req: Request, res:
              FROM message_attachments
              WHERE message_id = ANY($1::uuid[])
              ORDER BY message_id, created_at ASC`,
-            [messageIds],
+            [attachmentMessageIds],
           )
         : Promise.resolve({ rows: [] }),
       
@@ -402,12 +404,16 @@ router.get('/user/:userId', authenticateToken, async (req: Request, res: Respons
 
 /**
  * POST /messages/upload
- * Upload a file attachment (image, video, audio, document, etc.)
+ * Upload a file attachment (FAST PATH: create message immediately, SLOW PATH: upload media async)
+ * 
+ * This endpoint follows the WhatsApp pattern:
+ * - FAST PATH: Create message immediately, ACK to client
+ * - SLOW PATH: Upload media asynchronously, update message when done
  */
 router.post('/upload', authenticateToken, async (req: Request, res: Response) => {
   try {
     const senderId = req.user!.id;
-    const { recipientId, fileData, fileName, mimeType, type, metadata, thumbnailUrl } = req.body;
+    const { recipientId, fileData, fileName, mimeType, type, metadata, thumbnailUrl, chunkIndex, totalChunks, uploadId } = req.body;
 
     if (!recipientId || !fileData || !fileName || !type) {
       return res.status(400).json({ message: 'Recipient ID, file data, file name, and type are required' });
@@ -419,67 +425,117 @@ router.post('/upload', authenticateToken, async (req: Request, res: Response) =>
       return res.status(400).json({ message: 'Invalid attachment type' });
     }
 
-    // Use file service for file handling
-    const { uploadFile, generateUniqueFileName, base64ToBuffer } = await import('../services/fileService');
-    const uniqueFileName = generateUniqueFileName(fileName);
+    // HARD GATE: Validate file size BEFORE upload starts (WhatsApp pattern)
+    const { base64ToBuffer, validateFileBeforeUpload } = await import('../services/fileService');
     const fileBuffer = base64ToBuffer(fileData);
     const fileSize = fileBuffer.length;
-
-    // Upload file using centralized service
-    const fileUrl = await uploadFile(uniqueFileName, fileBuffer, mimeType);
-
-    // Check if recipient exists
-    const recipientCheck = await pool.query(`SELECT id FROM users WHERE id = $1`, [recipientId]);
-    if (recipientCheck.rows.length === 0) {
-      return res.status(404).json({ message: 'Recipient not found' });
+    
+    const validation = validateFileBeforeUpload(fileSize, mimeType);
+    if (!validation.valid) {
+      return res.status(400).json({ message: validation.error || 'File validation failed' });
     }
 
-    // Use message service for message creation
+    // Handle chunked uploads (for large files > 10MB)
+    if (chunkIndex !== undefined && totalChunks !== undefined && uploadId) {
+      const { uploadChunk } = await import('../services/mediaService');
+      
+      // If this is the first chunk, create message FIRST (FAST PATH)
+      let messageId: string | undefined;
+      if (chunkIndex === 0) {
+        const { createMessage } = await import('../services/messageService');
+        const message = await createMessage({
+          senderId,
+          recipientId,
+          content: fileName,
+          replyToMessageId: null,
+        });
+        messageId = message.id;
+
+        // Mark as pending
+        await pool.query(
+          `UPDATE messages SET has_attachments = TRUE, media_status = 'pending' WHERE id = $1`,
+          [messageId]
+        );
+
+        // Emit via WebSocket immediately
+        emitMessageToUsers(senderId, recipientId, { id: message.id });
+      }
+
+      // Process chunk
+      const result = await uploadChunk({
+        messageId: messageId || '', // Use existing messageId if not first chunk
+        fileData,
+        fileName,
+        mimeType,
+        type,
+        metadata,
+        thumbnailUrl,
+        chunkIndex,
+        totalChunks,
+        uploadId,
+      });
+
+      // If first chunk, return message + progress
+      if (chunkIndex === 0 && messageId) {
+        return res.json({
+          message: {
+            id: messageId,
+            senderId,
+            recipientId,
+            content: fileName,
+            status: 'sent',
+            createdAt: new Date().toISOString(),
+            hasAttachments: true,
+            attachmentPending: true,
+          },
+          uploadProgress: result.progress,
+          uploadComplete: result.complete,
+          uploadId,
+        });
+      }
+
+      // Subsequent chunks - return progress only
+      return res.json({
+        uploadProgress: result.progress,
+        uploadComplete: result.complete,
+        uploadId,
+      });
+    }
+
+    // FAST PATH: Create message immediately (don't wait for media upload)
     const { createMessage } = await import('../services/messageService');
     const message = await createMessage({
       senderId,
       recipientId,
-      content: fileName, // Use filename as content placeholder
+      content: fileName, // Use filename as placeholder
       replyToMessageId: null,
     });
 
-    // Handle thumbnail if provided
-    let thumbnailFileUrl = null;
-    if (thumbnailUrl && type === 'video') {
-      const { uploadFile, generateUniqueFileName, base64ToBuffer } = await import('../services/fileService');
-      const thumbnailFileName = generateUniqueFileName('thumb.jpg', 'thumb');
-      const thumbnailBuffer = base64ToBuffer(thumbnailUrl);
-      thumbnailFileUrl = await uploadFile(thumbnailFileName, thumbnailBuffer, 'image/jpeg');
-    }
-
-    // Create attachment record
-    const { rows: attachmentRows } = await pool.query(
-      `INSERT INTO message_attachments (
-        message_id, type, file_name, file_url, file_size, mime_type, thumbnail_url, metadata
-       )
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-       RETURNING id, type, file_name, file_url, file_size, mime_type, thumbnail_url, metadata, created_at`,
-      [
-        message.id,
-        type,
-        fileName,
-        fileUrl,
-        fileSize,
-        mimeType || null,
-        thumbnailFileUrl,
-        metadata ? JSON.stringify(metadata) : null,
-      ],
-    );
-
-    // Update message to mark as having attachments
+    // Mark message as having attachments with pending status (even before upload completes)
     await pool.query(
-      `UPDATE messages SET has_attachments = TRUE WHERE id = $1`,
+      `UPDATE messages SET has_attachments = TRUE, media_status = 'pending' WHERE id = $1`,
       [message.id]
     );
 
-    // Emit via WebSocket (minimal payload)
+    // Emit via WebSocket immediately (minimal payload - ID only)
     emitMessageToUsers(senderId, recipientId, { id: message.id });
 
+    // SLOW PATH: Queue media upload asynchronously (non-blocking)
+    const { queueMediaUpload } = await import('../services/mediaService');
+    queueMediaUpload({
+      messageId: message.id,
+      fileData,
+      fileName,
+      mimeType,
+      type,
+      metadata,
+      thumbnailUrl,
+    }).catch((err) => {
+      console.error('Failed to queue media upload:', err);
+      // Don't fail the request - message is already created
+    });
+
+    // Return immediately with message (media will be attached async)
     return res.json({
       message: {
         id: message.id,
@@ -488,21 +544,57 @@ router.post('/upload', authenticateToken, async (req: Request, res: Response) =>
         content: message.content,
         status: message.status,
         createdAt: message.createdAt.toISOString(),
-        attachment: {
-          id: attachmentRows[0].id,
-          type: attachmentRows[0].type,
-          fileName: attachmentRows[0].file_name,
-          fileUrl: attachmentRows[0].file_url,
-          fileSize: attachmentRows[0].file_size,
-          mimeType: attachmentRows[0].mime_type,
-          thumbnailUrl: attachmentRows[0].thumbnail_url,
-          metadata: attachmentRows[0].metadata,
-          createdAt: attachmentRows[0].created_at,
-        },
+        // Attachment will be added asynchronously - client can fetch via reconciliation
+        hasAttachments: true,
+        attachmentPending: true, // Signal that attachment is being uploaded
       },
     });
   } catch (err) {
     console.error('Upload file error', err);
+    return res.status(500).json({ message: 'Internal server error' });
+  }
+});
+
+/**
+ * POST /messages/upload/cancel
+ * Cancel an ongoing upload (non-blocking)
+ */
+router.post('/upload/cancel', authenticateToken, async (req: Request, res: Response) => {
+  try {
+    const { uploadId } = req.body;
+    
+    if (!uploadId) {
+      return res.status(400).json({ message: 'Upload ID is required' });
+    }
+
+    const { cancelUpload } = await import('../services/mediaService');
+    cancelUpload(uploadId);
+
+    return res.json({ success: true, message: 'Upload cancelled' });
+  } catch (err) {
+    console.error('Cancel upload error', err);
+    return res.status(500).json({ message: 'Internal server error' });
+  }
+});
+
+/**
+ * GET /messages/upload/progress/:uploadId
+ * Get upload progress for chunked uploads
+ */
+router.get('/upload/progress/:uploadId', authenticateToken, async (req: Request, res: Response) => {
+  try {
+    const { uploadId } = req.params;
+    
+    const { getUploadProgress } = await import('../services/mediaService');
+    const progress = getUploadProgress(uploadId);
+
+    if (progress === null) {
+      return res.status(404).json({ message: 'Upload not found' });
+    }
+
+    return res.json({ progress, uploadId });
+  } catch (err) {
+    console.error('Get upload progress error', err);
     return res.status(500).json({ message: 'Internal server error' });
   }
 });
@@ -750,12 +842,11 @@ router.post('/typing/:userId', authenticateToken, async (req: Request, res: Resp
       return res.status(400).json({ message: 'User ID is required' });
     }
 
-    // Store typing status (current user is typing to other user)
-    if (!typingStatus.has(otherUserId)) {
-      typingStatus.set(otherUserId, new Map());
-    }
-    const userTypingMap = typingStatus.get(otherUserId)!;
-    userTypingMap.set(currentUserId, Date.now());
+    // Store typing status in Redis (FAST PATH - non-blocking)
+    const { setTypingStatus } = await import('../redis');
+    setTypingStatus(currentUserId, otherUserId, true).catch((err) =>
+      console.error('Failed to set typing status:', err)
+    );
 
     return res.json({ success: true });
   } catch (err) {
@@ -777,16 +868,11 @@ router.get('/typing/:userId', authenticateToken, async (req: Request, res: Respo
       return res.status(400).json({ message: 'User ID is required' });
     }
 
-    // Check if other user is typing to current user
-    const userTypingMap = typingStatus.get(currentUserId);
-    const isTyping = userTypingMap?.has(otherUserId) ?? false;
-    const typingTimestamp = userTypingMap?.get(otherUserId) ?? 0;
+    // Check typing status from Redis (FAST PATH)
+    const { getTypingStatus } = await import('../redis');
+    const isTyping = await getTypingStatus(otherUserId, currentUserId);
 
-    // Only return true if typing status is recent (within last 3 seconds)
-    const now = Date.now();
-    const isRecentlyTyping = isTyping && (now - typingTimestamp) < 3000;
-
-    return res.json({ isTyping: isRecentlyTyping });
+    return res.json({ isTyping });
   } catch (err) {
     console.error('Get typing status error', err);
     return res.status(500).json({ message: 'Internal server error' });
@@ -802,12 +888,11 @@ router.post('/typing/:userId', authenticateToken, async (req: Request, res: Resp
     const currentUserId = req.user!.id;
     const recipientId = req.params.userId;
 
-    // Store typing status: recipientId -> { currentUserId: timestamp }
-    if (!typingStatus.has(recipientId)) {
-      typingStatus.set(recipientId, new Map());
-    }
-    const userMap = typingStatus.get(recipientId)!;
-    userMap.set(currentUserId, Date.now());
+    // Store typing status in Redis (FAST PATH - non-blocking)
+    const { setTypingStatus } = await import('../redis');
+    setTypingStatus(currentUserId, recipientId, true).catch((err) =>
+      console.error('Failed to set typing status:', err)
+    );
 
     return res.json({ success: true });
   } catch (err) {
@@ -825,20 +910,9 @@ router.get('/typing/:userId', authenticateToken, async (req: Request, res: Respo
     const currentUserId = req.user!.id;
     const otherUserId = req.params.userId;
 
-    // Check if other user is typing to current user
-    const userMap = typingStatus.get(currentUserId);
-    if (!userMap) {
-      return res.json({ isTyping: false });
-    }
-
-    const typingTimestamp = userMap.get(otherUserId);
-    if (!typingTimestamp) {
-      return res.json({ isTyping: false });
-    }
-
-    // Check if typing status is still fresh (within last 3 seconds)
-    const now = Date.now();
-    const isTyping = now - typingTimestamp < 3000;
+    // Check typing status from Redis (FAST PATH)
+    const { getTypingStatus } = await import('../redis');
+    const isTyping = await getTypingStatus(otherUserId, currentUserId);
 
     return res.json({ isTyping });
   } catch (err) {
