@@ -177,8 +177,8 @@ export async function queueMediaUpload(job: MediaUploadJob): Promise<void> {
  * Handle chunked upload (for large files)
  * Supports pause/resume
  */
-export async function uploadChunk(job: MediaUploadJob): Promise<{ progress: number; complete: boolean }> {
-  const { uploadId, chunkIndex, totalChunks, fileData, messageId } = job;
+export async function uploadChunk(job: MediaUploadJob): Promise<{ progress: number; complete: boolean; messageId?: string }> {
+  const { uploadId, chunkIndex, totalChunks, fileData, messageId, fileName, mimeType, type, metadata, thumbnailUrl } = job;
 
   if (!uploadId || chunkIndex === undefined || totalChunks === undefined) {
     throw new Error('Chunked upload requires uploadId, chunkIndex, and totalChunks');
