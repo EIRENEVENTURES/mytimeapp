@@ -76,7 +76,7 @@ export async function createMessage(params: CreateMessageParams): Promise<Messag
     const { rows } = await pool.query(
       `INSERT INTO messages (sender_id, recipient_id, content, status, reply_to_message_id, idempotency_key)
        VALUES ($1, $2, $3, $4, $5, $6)
-       RETURNING id, sender_id, recipient_id, content, status, created_at, reply_to_message_id, is_forwarded, is_edited, is_pinned`,
+       RETURNING id, sender_id, recipient_id, content, status, created_at, reply_to_message_id, is_forwarded, is_edited`,
       [senderId, recipientId, content.trim(), initialStatus, replyToMessageId || null, idempotencyKey || null],
     );
 
@@ -99,7 +99,7 @@ export async function createMessage(params: CreateMessageParams): Promise<Messag
       replyToMessageId: message.reply_to_message_id,
       isForwarded: message.is_forwarded || false,
       isEdited: message.is_edited || false,
-      isPinned: message.is_pinned || false,
+      isPinned: false, // New messages are never pinned initially (pinning is tracked in pinned_messages table)
     };
   } catch (err: any) {
     console.error('createMessage error:', {
