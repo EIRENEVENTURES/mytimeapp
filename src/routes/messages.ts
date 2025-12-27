@@ -25,6 +25,19 @@ router.get('/conversation/:userId', authenticateToken, async (req: Request, res:
     const currentUserId = req.user!.id;
     const otherUserId = req.params.userId;
 
+    // Ensure deleted_messages table exists (migration safety)
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS deleted_messages (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        message_id UUID NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
+        user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        deleted_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        UNIQUE (message_id, user_id)
+      )
+    `).catch(() => {
+      // Table might already exist, ignore error
+    });
+
     // Parse pagination parameters (cursor-based)
     const limit = Math.min(parseInt(req.query.limit as string) || 50, 50); // Default 50, max 50
     const before = req.query.before as string | undefined; // Message ID or timestamp to load messages before
@@ -407,6 +420,7 @@ router.get('/user/:userId', authenticateToken, async (req: Request, res: Respons
         id,
         display_name,
         username,
+        profile_picture,
         COALESCE(chat_rate_per_second, credit_per_second, 0)::numeric as credit_per_second,
         COALESCE(chat_rate_charging_enabled, FALSE) as chat_rate_charging_enabled,
         last_seen_at
@@ -438,10 +452,21 @@ router.get('/user/:userId', authenticateToken, async (req: Request, res: Respons
       }
     }
 
+    // Get base URL for constructing full profile picture URLs
+    const baseUrl = process.env.API_BASE_URL || 'http://localhost:4000';
+    
+    // Get full URL for profile picture
+    let userAvatar = user.profile_picture ?? null;
+    if (userAvatar && !userAvatar.startsWith('http')) {
+      // If it's a local path, construct full URL
+      userAvatar = `${baseUrl}${userAvatar}`;
+    }
+
     return res.json({
       id: user.id,
       displayName: user.display_name,
       username: user.username,
+      userAvatar,
       creditPerSecond: Number(user.credit_per_second) ?? 0,
       rateChargingEnabled: user.chat_rate_charging_enabled ?? false,
       activityStatus,
