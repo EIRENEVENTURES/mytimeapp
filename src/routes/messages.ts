@@ -706,6 +706,44 @@ router.get('/reconcile', authenticateToken, async (req: Request, res: Response) 
 });
 
 /**
+ * PUT /messages/batch-status
+ * Batch update message statuses (WhatsApp pattern: reduce network overhead)
+ */
+router.put('/batch-status', authenticateToken, async (req: Request, res: Response) => {
+  try {
+    const currentUserId = req.user!.id;
+    const { messageIds, status } = req.body;
+
+    if (!Array.isArray(messageIds) || messageIds.length === 0) {
+      return res.status(400).json({ message: 'Message IDs array is required' });
+    }
+
+    if (!['delivered', 'read'].includes(status)) {
+      return res.status(400).json({ message: 'Invalid status' });
+    }
+
+    // Batch update statuses (optimized single query)
+    const { rows } = await pool.query(
+      `UPDATE messages 
+       SET status = $1
+       WHERE id = ANY($2::uuid[])
+         AND recipient_id = $3
+         AND status != 'read' -- Don't downgrade from read
+       RETURNING id`,
+      [status, messageIds, currentUserId],
+    );
+
+    return res.json({
+      updated: rows.length,
+      messageIds: rows.map((r) => r.id),
+    });
+  } catch (err) {
+    console.error('Batch status update error', err);
+    return res.status(500).json({ message: 'Internal server error' });
+  }
+});
+
+/**
  * GET /messages/chats
  * Get list of all conversations with last message, time, and unread count
  */
