@@ -8,15 +8,38 @@ import { existsSync } from 'fs';
 
 const router = Router();
 
-// Ensure uploads directory exists
+// Ensure uploads directory exists (only for local storage)
 const UPLOADS_DIR = join(__dirname, '..', '..', 'uploads');
 const ensureUploadsDir = async () => {
-  if (!existsSync(UPLOADS_DIR)) {
-    await mkdir(UPLOADS_DIR, { recursive: true });
+  if (process.env.USE_BLOB_STORAGE !== 'true') {
+    if (!existsSync(UPLOADS_DIR)) {
+      await mkdir(UPLOADS_DIR, { recursive: true });
+    }
+    console.log('Uploads directory:', UPLOADS_DIR);
+  } else {
+    console.log('Using blob storage for file uploads');
   }
 };
 ensureUploadsDir();
-console.log('Uploads directory:', UPLOADS_DIR);
+
+// Blob storage upload function for Vercel Blob Storage
+async function uploadToBlobStorage(fileName: string, buffer: Buffer, contentType?: string): Promise<string> {
+  try {
+    // Dynamic import to avoid loading if not using blob storage
+    const { put } = await import('@vercel/blob');
+    
+    const blob = await put(fileName, buffer, {
+      access: 'public',
+      contentType: contentType || 'application/octet-stream',
+      token: process.env.BLOB_READ_WRITE_TOKEN,
+    });
+    
+    return blob.url;
+  } catch (error) {
+    console.error('Vercel Blob upload error:', error);
+    throw new Error(`Failed to upload to Vercel Blob: ${error instanceof Error ? error.message : 'Unknown error'}`);
+  }
+}
 
 // In-memory store for typing status (userId -> { typingUserId: timestamp })
 // In production, consider using Redis or a database table
@@ -410,7 +433,6 @@ router.post('/upload', authenticateToken, async (req: Request, res: Response) =>
     // Generate unique filename
     const fileExt = fileName.split('.').pop() || '';
     const uniqueFileName = `${Date.now()}-${Math.random().toString(36).substring(7)}.${fileExt}`;
-    const filePath = join(UPLOADS_DIR, uniqueFileName);
 
     // Handle base64 file data
     let fileBuffer: Buffer;
@@ -423,14 +445,33 @@ router.post('/upload', authenticateToken, async (req: Request, res: Response) =>
       fileBuffer = Buffer.from(fileData, 'base64');
     }
 
-    // Save file
-    await writeFile(filePath, fileBuffer);
-
     // Get file size
     const fileSize = fileBuffer.length;
 
-    // Create file URL (in production, this would be a CDN URL)
-    const fileUrl = `/uploads/${uniqueFileName}`;
+    // Upload to Vercel Blob Storage if configured, otherwise save locally
+    let fileUrl: string;
+    const useBlobStorage = process.env.USE_BLOB_STORAGE === 'true';
+    const blobReadWriteToken = process.env.BLOB_READ_WRITE_TOKEN;
+
+    if (useBlobStorage && blobReadWriteToken) {
+      // Upload to Vercel Blob Storage
+      try {
+        const blobUrl = await uploadToBlobStorage(uniqueFileName, fileBuffer, mimeType);
+        fileUrl = blobUrl;
+        console.log('File uploaded to Vercel Blob Storage:', fileUrl);
+      } catch (blobError) {
+        console.error('Vercel Blob storage upload failed, falling back to local:', blobError);
+        // Fallback to local storage
+        const filePath = join(UPLOADS_DIR, uniqueFileName);
+        await writeFile(filePath, fileBuffer);
+        fileUrl = `/uploads/${uniqueFileName}`;
+      }
+    } else {
+      // Save to local filesystem
+      const filePath = join(UPLOADS_DIR, uniqueFileName);
+      await writeFile(filePath, fileBuffer);
+      fileUrl = `/uploads/${uniqueFileName}`;
+    }
 
     // Check if recipient exists and is online (active within last 2 minutes)
     const recipientCheck = await pool.query(
@@ -473,9 +514,22 @@ router.post('/upload', authenticateToken, async (req: Request, res: Response) =>
       const thumbnailBase64 = thumbnailUrl.includes(',') ? thumbnailUrl.split(',')[1] : thumbnailUrl;
       const thumbnailBuffer = Buffer.from(thumbnailBase64, 'base64');
       const thumbnailFileName = `thumb-${Date.now()}-${Math.random().toString(36).substring(7)}.jpg`;
-      const thumbnailPath = join(UPLOADS_DIR, thumbnailFileName);
-      await writeFile(thumbnailPath, thumbnailBuffer);
-      thumbnailFileUrl = `/uploads/${thumbnailFileName}`;
+      
+      if (useBlobStorage && blobReadWriteToken) {
+        try {
+          const blobThumbnailUrl = await uploadToBlobStorage(thumbnailFileName, thumbnailBuffer, 'image/jpeg');
+          thumbnailFileUrl = blobThumbnailUrl;
+        } catch (blobError) {
+          console.error('Thumbnail Vercel Blob storage upload failed, falling back to local:', blobError);
+          const thumbnailPath = join(UPLOADS_DIR, thumbnailFileName);
+          await writeFile(thumbnailPath, thumbnailBuffer);
+          thumbnailFileUrl = `/uploads/${thumbnailFileName}`;
+        }
+      } else {
+        const thumbnailPath = join(UPLOADS_DIR, thumbnailFileName);
+        await writeFile(thumbnailPath, thumbnailBuffer);
+        thumbnailFileUrl = `/uploads/${thumbnailFileName}`;
+      }
     }
 
     // Create attachment record
