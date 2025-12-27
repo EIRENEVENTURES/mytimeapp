@@ -66,9 +66,14 @@ export async function isUserOnline(userId: string): Promise<boolean> {
   const client = getRedisClient();
   if (!client) return false;
 
-  const key = `presence:${userId}`;
-  const result = await client.exists(key);
-  return result === 1;
+  try {
+    const key = `presence:${userId}`;
+    const result = await client.exists(key);
+    return result === 1;
+  } catch (err) {
+    console.error('Redis error checking user online status:', err);
+    return false; // Default to offline if Redis fails
+  }
 }
 
 /**

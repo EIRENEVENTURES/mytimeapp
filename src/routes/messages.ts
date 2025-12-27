@@ -308,6 +308,14 @@ router.post('/', authenticateToken, async (req: Request, res: Response) => {
       message: messageData,
     });
   } catch (err: any) {
+    console.error('Send message error - Full error details:', {
+      message: err.message,
+      stack: err.stack,
+      code: err.code,
+      constraint: err.constraint,
+      name: err.name,
+    });
+    
     if (err.message === 'Recipient not found') {
       return res.status(404).json({ message: err.message });
     }
@@ -334,12 +342,15 @@ router.post('/', authenticateToken, async (req: Request, res: Response) => {
             replyToMessageId: existing.replyToMessageId,
           },
         });
-      } catch {
+      } catch (retryErr) {
+        console.error('Failed to fetch existing message after idempotency collision:', retryErr);
         // Fall through to error handler
       }
     }
-    console.error('Send message error', err);
-    return res.status(500).json({ message: 'Internal server error' });
+    return res.status(500).json({ 
+      message: 'Internal server error',
+      error: process.env.NODE_ENV === 'development' ? err.message : undefined,
+    });
   }
 });
 
