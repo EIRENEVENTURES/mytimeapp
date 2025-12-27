@@ -853,15 +853,18 @@ router.get('/chats', authenticateToken, async (req: Request, res: Response) => {
       console.log(`Unread counts from DB for user ${currentUserId}:`, Array.from(unreadCountsMap.entries()));
     }
 
-    // Query 4: Get user details (single query with IN clause)
+    // Query 4: Get user details including profile pictures (single query with IN clause)
     const usersResult = await pool.query(
-      `SELECT id, display_name, username
+      `SELECT id, display_name, username, profile_picture
       FROM users
       WHERE id = ANY($1::uuid[]) AND is_active = TRUE`,
       [partnerIds],
     );
 
     const usersMap = new Map(usersResult.rows.map((u) => [u.id, u]));
+
+    // Get base URL for constructing full profile picture URLs
+    const baseUrl = process.env.API_BASE_URL || 'http://localhost:4000';
 
     // Combine results
     const chats = partnerIds
@@ -880,11 +883,18 @@ router.get('/chats', authenticateToken, async (req: Request, res: Response) => {
           console.log(`[ChatList] User ${currentUserId} has ${unreadCount} unread messages from ${partnerId} (${user.display_name || user.username})`);
         }
 
+        // Get full URL for profile picture
+        let profilePictureUrl = user.profile_picture ?? null;
+        if (profilePictureUrl && !profilePictureUrl.startsWith('http')) {
+          // If it's a local path, construct full URL
+          profilePictureUrl = `${baseUrl}${profilePictureUrl}`;
+        }
+
         return {
           id: user.id,
           userId: user.id,
           userName: user.display_name || user.username || 'Unknown',
-          userAvatar: null,
+          userAvatar: profilePictureUrl,
           lastMessage: lastMessage?.content || null,
           lastMessageTime: lastMessage?.created_at || null,
           lastMessageStatus: lastMessage?.sender_id === currentUserId ? lastMessage?.status : undefined,
