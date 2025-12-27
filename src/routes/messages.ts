@@ -292,6 +292,20 @@ router.post('/', authenticateToken, async (req: Request, res: Response) => {
       return res.status(400).json({ message: 'Recipient ID and content are required' });
     }
 
+    // Ensure blocked_users table exists (migration safety)
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS blocked_users (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        blocker_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        blocked_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        reason TEXT,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        UNIQUE (blocker_id, blocked_id)
+      )
+    `).catch(() => {
+      // Table might already exist, ignore error
+    });
+
     // Check if user is blocked
     const blockedCheck = await pool.query(
       `SELECT 1 FROM blocked_users 
@@ -794,6 +808,20 @@ router.put('/batch-status', authenticateToken, async (req: Request, res: Respons
 router.get('/chats', authenticateToken, async (req: Request, res: Response) => {
   try {
     const currentUserId = req.user!.id;
+
+    // Ensure blocked_users table exists (migration safety)
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS blocked_users (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        blocker_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        blocked_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        reason TEXT,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        UNIQUE (blocker_id, blocked_id)
+      )
+    `).catch(() => {
+      // Table might already exist, ignore error
+    });
 
     // Optimized: Split into multiple cheap queries to avoid GROUP BY and complex CTEs
     // Query 1: Get distinct conversation partners (index scan)
