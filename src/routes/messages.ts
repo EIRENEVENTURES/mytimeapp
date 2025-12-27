@@ -16,6 +16,7 @@ const ensureUploadsDir = async () => {
   }
 };
 ensureUploadsDir();
+console.log('Uploads directory:', UPLOADS_DIR);
 
 // In-memory store for typing status (userId -> { typingUserId: timestamp })
 // In production, consider using Redis or a database table
