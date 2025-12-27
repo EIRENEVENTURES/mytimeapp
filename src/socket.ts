@@ -51,6 +51,15 @@ function authenticateSocket(socket: AuthenticatedSocket, token: string): string 
 }
 
 /**
+ * Get conversation room ID for two users
+ */
+function getConversationRoomId(userId1: string, userId2: string): string {
+  // Sort user IDs to ensure consistent room ID
+  const [id1, id2] = [userId1, userId2].sort();
+  return `conversation:${id1}:${id2}`;
+}
+
+/**
  * Setup Socket.IO event handlers
  */
 export function setupSocketIO(io: Server): void {
@@ -241,15 +250,7 @@ export function setupSocketIO(io: Server): void {
         }
       });
     });
-}
-
-/**
- * Get conversation room ID for two users
- */
-function getConversationRoomId(userId1: string, userId2: string): string {
-  // Sort user IDs to ensure consistent room ID
-  const [id1, id2] = [userId1, userId2].sort();
-  return `conversation:${id1}:${id2}`;
+  });
 }
 
 /**
