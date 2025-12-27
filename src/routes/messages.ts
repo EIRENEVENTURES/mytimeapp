@@ -453,6 +453,12 @@ router.post('/upload', authenticateToken, async (req: Request, res: Response) =>
     const useBlobStorage = process.env.USE_BLOB_STORAGE === 'true';
     const blobReadWriteToken = process.env.BLOB_READ_WRITE_TOKEN;
 
+    console.log('Upload configuration:', {
+      useBlobStorage,
+      hasToken: !!blobReadWriteToken,
+      fileName: uniqueFileName,
+    });
+
     if (useBlobStorage && blobReadWriteToken) {
       // Upload to Vercel Blob Storage
       try {
@@ -465,12 +471,14 @@ router.post('/upload', authenticateToken, async (req: Request, res: Response) =>
         const filePath = join(UPLOADS_DIR, uniqueFileName);
         await writeFile(filePath, fileBuffer);
         fileUrl = `/uploads/${uniqueFileName}`;
+        console.log('File saved locally as fallback:', filePath);
       }
     } else {
       // Save to local filesystem
       const filePath = join(UPLOADS_DIR, uniqueFileName);
       await writeFile(filePath, fileBuffer);
       fileUrl = `/uploads/${uniqueFileName}`;
+      console.log('File saved locally:', filePath, 'URL:', fileUrl);
     }
 
     // Check if recipient exists and is online (active within last 2 minutes)
