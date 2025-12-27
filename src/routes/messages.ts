@@ -2,9 +2,6 @@
 import { Router, Request, Response } from 'express';
 import { authenticateToken } from '../middleware/auth';
 import { pool } from '../db';
-import { writeFile, mkdir } from 'fs/promises';
-import { join } from 'path';
-import { existsSync } from 'fs';
 import { emitMessageToUsers } from '../socket';
 import {
   isUserOnline,
@@ -15,42 +12,8 @@ import {
 
 const router = Router();
 
-// Ensure uploads directory exists (only for local storage)
-const UPLOADS_DIR = join(__dirname, '..', '..', 'uploads');
-const ensureUploadsDir = async () => {
-  if (process.env.USE_BLOB_STORAGE !== 'true') {
-    if (!existsSync(UPLOADS_DIR)) {
-      await mkdir(UPLOADS_DIR, { recursive: true });
-    }
-    console.log('Uploads directory:', UPLOADS_DIR);
-  } else {
-    console.log('Using blob storage for file uploads');
-  }
-};
-ensureUploadsDir();
-
-// Blob storage upload function for Vercel Blob Storage
-async function uploadToBlobStorage(fileName: string, buffer: Buffer, contentType?: string): Promise<string> {
-  try {
-    // Dynamic import to avoid loading if not using blob storage
-    const { put } = await import('@vercel/blob');
-    
-    const blob = await put(fileName, buffer, {
-      access: 'public',
-      contentType: contentType || 'application/octet-stream',
-      token: process.env.BLOB_READ_WRITE_TOKEN,
-    });
-    
-    return blob.url;
-  } catch (error) {
-    console.error('Vercel Blob upload error:', error);
-    throw new Error(`Failed to upload to Vercel Blob: ${error instanceof Error ? error.message : 'Unknown error'}`);
-  }
-}
-
+// File handling moved to fileService.ts
 // Typing status moved to Redis (see redis.ts)
-// In-memory store kept as fallback only (deprecated)
-const typingStatus = new Map<string, Map<string, number>>();
 
 /**
  * GET /messages/conversation/:userId
@@ -86,21 +49,6 @@ router.get('/conversation/:userId', authenticateToken, async (req: Request, res:
     );
 
     // Build cursor-based query - load latest messages first, then reverse for chronological order
-    // Ensure is_forwarded column exists (for backward compatibility)
-    await pool.query(`
-      ALTER TABLE messages 
-      ADD COLUMN IF NOT EXISTS is_forwarded BOOLEAN NOT NULL DEFAULT FALSE
-    `).catch(() => {
-      // Column might already exist, ignore error
-    });
-
-    // Ensure is_edited column exists (for backward compatibility)
-    await pool.query(`
-      ALTER TABLE messages 
-      ADD COLUMN IF NOT EXISTS is_edited BOOLEAN NOT NULL DEFAULT FALSE
-    `).catch(() => {
-      // Column might already exist, ignore error
-    });
 
     // Optimized: Use UNION to leverage separate indexes instead of OR
     // This allows index-only scans on both branches
@@ -329,110 +277,63 @@ router.post('/', authenticateToken, async (req: Request, res: Response) => {
       return res.status(400).json({ message: 'Recipient ID and content are required' });
     }
 
-    // Idempotency check: if idempotencyKey provided, check for existing message
-    if (idempotencyKey) {
-      const existing = await pool.query(
-        `SELECT id, sender_id, recipient_id, content, status, created_at, reply_to_message_id
-         FROM messages WHERE idempotency_key = $1`,
-        [idempotencyKey]
-      );
-      if (existing.rows.length > 0) {
-        const msg = existing.rows[0];
-        return res.json({
-          message: {
-            id: msg.id,
-            senderId: msg.sender_id,
-            recipientId: msg.recipient_id,
-            content: msg.content,
-            status: msg.status,
-            createdAt: msg.created_at.toISOString(),
-            replyToMessageId: msg.reply_to_message_id,
-          },
-        });
-      }
-    }
-
-    // Check if recipient exists (minimal query)
-    const recipientCheck = await pool.query(`SELECT id FROM users WHERE id = $1`, [recipientId]);
-    if (recipientCheck.rows.length === 0) {
-      return res.status(404).json({ message: 'Recipient not found' });
-    }
-
-    // Check presence via Redis (faster than DB query)
-    const recipientOnline = await isUserOnline(recipientId);
-    const initialStatus = recipientOnline ? 'delivered' : 'sent';
-
-    // Insert message (append-only write) - ensure idempotency_key column exists
-    await pool.query(`
-      ALTER TABLE messages 
-      ADD COLUMN IF NOT EXISTS idempotency_key VARCHAR(255) UNIQUE
-    `).catch(() => {
-      // Column might already exist, ignore error
+    // Use message service for business logic
+    const { createMessage } = await import('../services/messageService');
+    const message = await createMessage({
+      senderId,
+      recipientId,
+      content,
+      replyToMessageId: replyToMessageId || null,
+      idempotencyKey: idempotencyKey || null,
     });
 
-    const { rows } = await pool.query(
-      `INSERT INTO messages (sender_id, recipient_id, content, status, reply_to_message_id, idempotency_key)
-       VALUES ($1, $2, $3, $4, $5, $6)
-       RETURNING id, sender_id, recipient_id, content, status, created_at, reply_to_message_id`,
-      [
-        senderId,
-        recipientId,
-        content.trim(),
-        initialStatus,
-        replyToMessageId || null,
-        idempotencyKey || null,
-      ],
-    );
-
-    const message = rows[0];
-
-    // Update unread counter in Redis (async, non-blocking)
-    if (!recipientOnline) {
-      incrementUnreadCount(recipientId, senderId).catch((err) =>
-        console.error('Failed to increment unread count:', err)
-      );
-    }
-
-    // Format minimal message data for WebSocket (IDs only for fan-out)
+    // Format message for response
     const messageData = {
       id: message.id,
-      senderId: message.sender_id,
-      recipientId: message.recipient_id,
+      senderId: message.senderId,
+      recipientId: message.recipientId,
       content: message.content,
       status: message.status,
-      createdAt: message.created_at.toISOString(),
-      replyToMessageId: message.reply_to_message_id,
+      createdAt: message.createdAt.toISOString(),
+      replyToMessageId: message.replyToMessageId,
     };
 
     // Emit via WebSocket AFTER persistence (best effort, non-blocking)
     // Use minimal payload: only message ID for initial notification
-    emitMessageToUsers(senderId, recipientId, { id: message.id }); // Minimal payload
+    emitMessageToUsers(senderId, recipientId, { id: message.id });
 
     return res.json({
       message: messageData,
     });
   } catch (err: any) {
+    if (err.message === 'Recipient not found') {
+      return res.status(404).json({ message: err.message });
+    }
     // Handle unique constraint violation (idempotency key collision)
     if (err.code === '23505' && err.constraint?.includes('idempotency_key')) {
       // Message already exists, fetch and return it
-      const existing = await pool.query(
-        `SELECT id, sender_id, recipient_id, content, status, created_at, reply_to_message_id
-         FROM messages WHERE idempotency_key = $1`,
-        [req.body.idempotencyKey]
-      );
-      if (existing.rows.length > 0) {
-        const msg = existing.rows[0];
+      const { createMessage } = await import('../services/messageService');
+      try {
+        const existing = await createMessage({
+          senderId: req.user!.id,
+          recipientId: req.body.recipientId,
+          content: req.body.content,
+          replyToMessageId: req.body.replyToMessageId || null,
+          idempotencyKey: req.body.idempotencyKey || null,
+        });
         return res.json({
           message: {
-            id: msg.id,
-            senderId: msg.sender_id,
-            recipientId: msg.recipient_id,
-            content: msg.content,
-            status: msg.status,
-            createdAt: msg.created_at.toISOString(),
-            replyToMessageId: msg.reply_to_message_id,
+            id: existing.id,
+            senderId: existing.senderId,
+            recipientId: existing.recipientId,
+            content: existing.content,
+            status: existing.status,
+            createdAt: existing.createdAt.toISOString(),
+            replyToMessageId: existing.replyToMessageId,
           },
         });
+      } catch {
+        // Fall through to error handler
       }
     }
     console.error('Send message error', err);
@@ -518,114 +419,37 @@ router.post('/upload', authenticateToken, async (req: Request, res: Response) =>
       return res.status(400).json({ message: 'Invalid attachment type' });
     }
 
-    // Generate unique filename
-    const fileExt = fileName.split('.').pop() || '';
-    const uniqueFileName = `${Date.now()}-${Math.random().toString(36).substring(7)}.${fileExt}`;
-
-    // Handle base64 file data
-    let fileBuffer: Buffer;
-    if (fileData.startsWith('data:')) {
-      // Base64 with data URI prefix
-      const base64Data = fileData.split(',')[1];
-      fileBuffer = Buffer.from(base64Data, 'base64');
-    } else {
-      // Plain base64
-      fileBuffer = Buffer.from(fileData, 'base64');
-    }
-
-    // Get file size
+    // Use file service for file handling
+    const { uploadFile, generateUniqueFileName, base64ToBuffer } = await import('../services/fileService');
+    const uniqueFileName = generateUniqueFileName(fileName);
+    const fileBuffer = base64ToBuffer(fileData);
     const fileSize = fileBuffer.length;
 
-    // Upload to Vercel Blob Storage if configured, otherwise save locally
-    let fileUrl: string;
-    const useBlobStorage = process.env.USE_BLOB_STORAGE === 'true';
-    const blobReadWriteToken = process.env.BLOB_READ_WRITE_TOKEN;
+    // Upload file using centralized service
+    const fileUrl = await uploadFile(uniqueFileName, fileBuffer, mimeType);
 
-    console.log('Upload configuration:', {
-      useBlobStorage,
-      hasToken: !!blobReadWriteToken,
-      fileName: uniqueFileName,
-    });
-
-    if (useBlobStorage && blobReadWriteToken) {
-      // Upload to Vercel Blob Storage
-      try {
-        const blobUrl = await uploadToBlobStorage(uniqueFileName, fileBuffer, mimeType);
-        fileUrl = blobUrl;
-        console.log('File uploaded to Vercel Blob Storage:', fileUrl);
-      } catch (blobError) {
-        console.error('Vercel Blob storage upload failed, falling back to local:', blobError);
-        // Fallback to local storage
-        const filePath = join(UPLOADS_DIR, uniqueFileName);
-        await writeFile(filePath, fileBuffer);
-        fileUrl = `/uploads/${uniqueFileName}`;
-        console.log('File saved locally as fallback:', filePath);
-      }
-    } else {
-      // Save to local filesystem
-      const filePath = join(UPLOADS_DIR, uniqueFileName);
-      await writeFile(filePath, fileBuffer);
-      fileUrl = `/uploads/${uniqueFileName}`;
-      console.log('File saved locally:', filePath, 'URL:', fileUrl);
-    }
-
-    // Check if recipient exists and is online (active within last 2 minutes)
-    const recipientCheck = await pool.query(
-      `SELECT id, last_seen_at FROM users WHERE id = $1`,
-      [recipientId]
-    );
-    
+    // Check if recipient exists
+    const recipientCheck = await pool.query(`SELECT id FROM users WHERE id = $1`, [recipientId]);
     if (recipientCheck.rows.length === 0) {
       return res.status(404).json({ message: 'Recipient not found' });
     }
 
-    const recipient = recipientCheck.rows[0];
-    let initialStatus = 'sent'; // Default to sent for offline users
-    
-    // Check if recipient is online (active within last 2 minutes)
-    if (recipient.last_seen_at) {
-      const lastSeen = new Date(recipient.last_seen_at as Date).getTime();
-      const now = Date.now();
-      const diffMinutes = (now - lastSeen) / (1000 * 60);
-      
-      if (diffMinutes <= 2) {
-        // Recipient is online, mark as delivered
-        initialStatus = 'delivered';
-      }
-    }
-
-    // Create message with attachment
-    const { rows: messageRows } = await pool.query(
-      `INSERT INTO messages (sender_id, recipient_id, content, status, has_attachments)
-       VALUES ($1, $2, $3, $4, TRUE)
-       RETURNING id, sender_id, recipient_id, content, status, created_at`,
-      [senderId, recipientId, fileName, initialStatus], // Use filename as content placeholder
-    );
-
-    const message = messageRows[0];
+    // Use message service for message creation
+    const { createMessage } = await import('../services/messageService');
+    const message = await createMessage({
+      senderId,
+      recipientId,
+      content: fileName, // Use filename as content placeholder
+      replyToMessageId: null,
+    });
 
     // Handle thumbnail if provided
     let thumbnailFileUrl = null;
     if (thumbnailUrl && type === 'video') {
-      const thumbnailBase64 = thumbnailUrl.includes(',') ? thumbnailUrl.split(',')[1] : thumbnailUrl;
-      const thumbnailBuffer = Buffer.from(thumbnailBase64, 'base64');
-      const thumbnailFileName = `thumb-${Date.now()}-${Math.random().toString(36).substring(7)}.jpg`;
-      
-      if (useBlobStorage && blobReadWriteToken) {
-        try {
-          const blobThumbnailUrl = await uploadToBlobStorage(thumbnailFileName, thumbnailBuffer, 'image/jpeg');
-          thumbnailFileUrl = blobThumbnailUrl;
-        } catch (blobError) {
-          console.error('Thumbnail Vercel Blob storage upload failed, falling back to local:', blobError);
-          const thumbnailPath = join(UPLOADS_DIR, thumbnailFileName);
-          await writeFile(thumbnailPath, thumbnailBuffer);
-          thumbnailFileUrl = `/uploads/${thumbnailFileName}`;
-        }
-      } else {
-        const thumbnailPath = join(UPLOADS_DIR, thumbnailFileName);
-        await writeFile(thumbnailPath, thumbnailBuffer);
-        thumbnailFileUrl = `/uploads/${thumbnailFileName}`;
-      }
+      const { uploadFile, generateUniqueFileName, base64ToBuffer } = await import('../services/fileService');
+      const thumbnailFileName = generateUniqueFileName('thumb.jpg', 'thumb');
+      const thumbnailBuffer = base64ToBuffer(thumbnailUrl);
+      thumbnailFileUrl = await uploadFile(thumbnailFileName, thumbnailBuffer, 'image/jpeg');
     }
 
     // Create attachment record
@@ -647,14 +471,23 @@ router.post('/upload', authenticateToken, async (req: Request, res: Response) =>
       ],
     );
 
+    // Update message to mark as having attachments
+    await pool.query(
+      `UPDATE messages SET has_attachments = TRUE WHERE id = $1`,
+      [message.id]
+    );
+
+    // Emit via WebSocket (minimal payload)
+    emitMessageToUsers(senderId, recipientId, { id: message.id });
+
     return res.json({
       message: {
         id: message.id,
-        senderId: message.sender_id,
-        recipientId: message.recipient_id,
+        senderId: message.senderId,
+        recipientId: message.recipientId,
         content: message.content,
         status: message.status,
-        createdAt: message.created_at,
+        createdAt: message.createdAt.toISOString(),
         attachment: {
           id: attachmentRows[0].id,
           type: attachmentRows[0].type,

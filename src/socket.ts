@@ -4,7 +4,7 @@
 import { Server, Socket } from 'socket.io';
 import jwt from 'jsonwebtoken';
 import { pool } from './db';
-import { setUserPresence, setTypingStatus, getTypingUsers } from './redis';
+import { setUserPresence, setTypingStatus } from './redis';
 
 // Store io instance for use in routes
 let ioInstance: Server | null = null;
@@ -130,6 +130,7 @@ export function setupSocketIO(io: Server): void {
     });
 
     // Handle message sending (optional - can still use REST API)
+    // Note: This is kept for backward compatibility, but REST API is preferred
     socket.on('message:send', async (data: MessageData) => {
       try {
         // Validate data
@@ -138,47 +139,32 @@ export function setupSocketIO(io: Server): void {
           return;
         }
 
-        // Check if recipient is online
-        const recipientSocketId = userSockets.get(data.recipientId);
-        const isRecipientOnline = !!recipientSocketId;
+        // Use message service for business logic
+        const { createMessage } = await import('./services/messageService');
+        const message = await createMessage({
+          senderId: userId,
+          recipientId: data.recipientId,
+          content: data.content,
+          replyToMessageId: data.replyToMessageId || null,
+        });
 
-        // Insert message into database
-        const { rows } = await pool.query(
-          `INSERT INTO messages (sender_id, recipient_id, content, status, reply_to_message_id)
-           VALUES ($1, $2, $3, $4, $5)
-           RETURNING id, sender_id, recipient_id, content, status, created_at, reply_to_message_id, is_forwarded, is_edited, is_pinned`,
-          [
-            userId,
-            data.recipientId,
-            data.content.trim(),
-            isRecipientOnline ? 'delivered' : 'sent',
-            data.replyToMessageId || null,
-          ]
-        );
-
-        const message = rows[0];
-
-        // Format message for client
+        // Format message for client (minimal payload - ID only for fan-out)
         const messageData = {
           id: message.id,
-          senderId: message.sender_id,
-          recipientId: message.recipient_id,
+          senderId: message.senderId,
+          recipientId: message.recipientId,
           content: message.content,
           status: message.status,
-          createdAt: message.created_at.toISOString(),
-          replyToMessageId: message.reply_to_message_id,
-          isForwarded: message.is_forwarded || false,
-          isEdited: message.is_edited || false,
-          isPinned: message.is_pinned || false,
+          createdAt: message.createdAt.toISOString(),
+          replyToMessageId: message.replyToMessageId,
+          isForwarded: message.isForwarded || false,
+          isEdited: message.isEdited || false,
+          isPinned: message.isPinned || false,
         };
 
-        // Emit to sender (confirmation)
-        socket.emit('message:new', messageData);
-
-        // Emit to recipient if online
-        if (recipientSocketId) {
-          io.to(`user:${data.recipientId}`).emit('message:new', messageData);
-        }
+        // Emit minimal payload (ID only) - client should fetch full message if needed
+        socket.emit('message:new', { id: message.id });
+        io.to(`user:${data.recipientId}`).emit('message:new', { id: message.id });
       } catch (error) {
         console.error('Error handling message:send:', error);
         socket.emit('error', { message: 'Failed to send message' });

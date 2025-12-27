@@ -394,20 +394,20 @@ router.put('/me', authenticateToken, async (req: Request, res: Response) => {
 });
 
 /**
- * GET /user/search?q=...&limit=20&cursor=0
+ * GET /user/search?q=...&limit=20&cursor=...
  *
  * Search for users by username or display name.
  * - q: search string (required, trimmed, case-insensitive)
  * - limit: max items per page (default 20, max 50)
- * - cursor: numeric offset for pagination (default 0)
+ * - cursor: user ID for cursor-based pagination (optional)
  *
- * Returns: { users: [...], nextCursor: number | null }
+ * Returns: { users: [...], nextCursor: string | null }
  */
 router.get('/search', authenticateToken, async (req: Request, res: Response) => {
   try {
     const rawQuery = (req.query.q as string | undefined)?.trim() ?? '';
     const limitParam = Number(req.query.limit ?? 20);
-    const cursorParam = Number(req.query.cursor ?? 0);
+    const cursor = req.query.cursor as string | undefined;
 
     if (!rawQuery) {
       return res.json({ users: [], nextCursor: null });
@@ -416,14 +416,12 @@ router.get('/search', authenticateToken, async (req: Request, res: Response) => 
     const limit = Number.isFinite(limitParam)
       ? Math.max(1, Math.min(limitParam, 50))
       : 20;
-    const offset = Number.isFinite(cursorParam) && cursorParam >= 0 ? cursorParam : 0;
 
     const pattern = `%${rawQuery.toLowerCase()}%`;
     const currentUserId = req.user!.id;
 
-    // Fetch one extra record to know if there are more pages
-    const { rows } = await pool.query(
-      `
+    // Build cursor-based query
+    let query = `
       SELECT
         id,
         display_name,
@@ -443,15 +441,34 @@ router.get('/search', authenticateToken, async (req: Request, res: Response) => 
           LOWER(username) LIKE $2
           OR LOWER(display_name) LIKE $2
         )
-      ORDER BY ratings DESC NULLS LAST, display_name ASC
-      LIMIT $3 OFFSET $4
-      `,
-      [currentUserId, pattern, limit + 1, offset],
-    );
+    `;
+    const params: any[] = [currentUserId, pattern];
+
+    // Add cursor condition if provided
+    if (cursor) {
+      // Get cursor user's ratings and display_name for stable cursor
+      const cursorResult = await pool.query(
+        `SELECT ratings, display_name FROM users WHERE id = $1`,
+        [cursor]
+      );
+      if (cursorResult.rows.length > 0) {
+        const cursorUser = cursorResult.rows[0];
+        query += ` AND (
+          (ratings < $${params.length + 1}::numeric) OR
+          (ratings = $${params.length + 1}::numeric AND display_name > $${params.length + 2})
+        )`;
+        params.push(cursorUser.ratings || 0, cursorUser.display_name);
+      }
+    }
+
+    query += ` ORDER BY ratings DESC NULLS LAST, display_name ASC LIMIT $${params.length + 1}`;
+    params.push(limit + 1); // Fetch one extra to check for more
+
+    const { rows } = await pool.query(query, params);
 
     const hasMore = rows.length > limit;
     const users = hasMore ? rows.slice(0, limit) : rows;
-    const nextCursor = hasMore ? offset + limit : null;
+    const nextCursor = hasMore && users.length > 0 ? users[users.length - 1].id : null;
 
     const now = Date.now();
 
