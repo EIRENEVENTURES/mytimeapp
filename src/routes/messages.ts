@@ -612,7 +612,8 @@ router.get('/upload/progress/:uploadId', authenticateToken, async (req: Request,
 
 /**
  * GET /messages/unread-count
- * Get total count of unread messages for the current user
+ * Get count of unique users with unread messages (for HomeScreen badge)
+ * This is different from the total unread message count - it counts conversations, not messages
  */
 router.get('/unread-count', authenticateToken, async (req: Request, res: Response) => {
   try {
@@ -620,22 +621,25 @@ router.get('/unread-count', authenticateToken, async (req: Request, res: Respons
     const { getAllUnreadCounts } = await import('../redis');
 
     // Try Redis first (fast)
+    // Count unique users (senders) who have unread messages
     const redisCounts = await getAllUnreadCounts(currentUserId);
     if (redisCounts.size > 0) {
-      const total = Array.from(redisCounts.values()).reduce((sum, count) => sum + count, 0);
-      return res.json({ unreadCount: total });
+      // Count unique users (keys in the map), not total messages
+      const uniqueUsersCount = redisCounts.size;
+      return res.json({ unreadCount: uniqueUsersCount });
     }
 
     // Fallback to DB if Redis unavailable
+    // Count DISTINCT sender_id to get number of unique users with unread messages
     const { rows } = await pool.query(
-      `SELECT COUNT(*) as unread_count
+      `SELECT COUNT(DISTINCT sender_id) as unread_users_count
        FROM messages
        WHERE recipient_id = $1
          AND status != 'read'`,
       [currentUserId],
     );
 
-    const unreadCount = parseInt(rows[0].unread_count, 10) || 0;
+    const unreadCount = parseInt(rows[0].unread_users_count, 10) || 0;
     return res.json({ unreadCount });
   } catch (err) {
     console.error('Get unread count error', err);
