@@ -629,8 +629,10 @@ router.get('/unread-count', authenticateToken, async (req: Request, res: Respons
     const { getAllUnreadCounts } = await import('../redis');
 
     // Try Redis first (fast)
-    // Count unique users (senders) who have unread messages
+    // getAllUnreadCounts returns Map<senderId, count> for messages received by currentUserId
+    // Count unique users (senders) who have unread messages TO currentUserId
     const redisCounts = await getAllUnreadCounts(currentUserId);
+    console.log(`[UnreadCount API] User ${currentUserId} has unread messages from ${redisCounts.size} unique senders:`, Array.from(redisCounts.keys()));
     if (redisCounts.size > 0) {
       // Count unique users (keys in the map), not total messages
       const uniqueUsersCount = redisCounts.size;
@@ -639,6 +641,7 @@ router.get('/unread-count', authenticateToken, async (req: Request, res: Respons
 
     // Fallback to DB if Redis unavailable
     // Count DISTINCT sender_id to get number of unique users with unread messages
+    // IMPORTANT: Only count messages where currentUserId is the RECIPIENT
     const { rows } = await pool.query(
       `SELECT COUNT(DISTINCT sender_id) as unread_users_count
        FROM messages
@@ -648,6 +651,7 @@ router.get('/unread-count', authenticateToken, async (req: Request, res: Respons
     );
 
     const unreadCount = parseInt(rows[0].unread_users_count, 10) || 0;
+    console.log(`[UnreadCount API] User ${currentUserId} has ${unreadCount} unique senders with unread messages (from DB)`);
     return res.json({ unreadCount });
   } catch (err) {
     console.error('Get unread count error', err);
@@ -825,13 +829,17 @@ router.get('/chats', authenticateToken, async (req: Request, res: Response) => {
     );
 
     // Query 3: Get unread counts (using partial index - no GROUP BY needed)
+    // IMPORTANT: Only count messages where currentUserId is the RECIPIENT (not sender)
     // Use Redis if available, otherwise fallback to DB
     const { getAllUnreadCounts } = await import('../redis');
     let unreadCountsMap: Map<string, number>;
     try {
+      // getAllUnreadCounts returns Map<senderId, count> for messages received by currentUserId
       unreadCountsMap = await getAllUnreadCounts(currentUserId);
+      console.log(`Unread counts for user ${currentUserId}:`, Array.from(unreadCountsMap.entries()));
     } catch {
       // Fallback: single query with partial index (faster than GROUP BY)
+      // Only count messages where currentUserId is the recipient
       const unreadResult = await pool.query(
         `SELECT sender_id, COUNT(*) as unread_count
         FROM messages
@@ -842,6 +850,7 @@ router.get('/chats', authenticateToken, async (req: Request, res: Response) => {
       unreadCountsMap = new Map(
         unreadResult.rows.map((r) => [r.sender_id, parseInt(r.unread_count, 10)])
       );
+      console.log(`Unread counts from DB for user ${currentUserId}:`, Array.from(unreadCountsMap.entries()));
     }
 
     // Query 4: Get user details (single query with IN clause)
@@ -861,7 +870,15 @@ router.get('/chats', authenticateToken, async (req: Request, res: Response) => {
         if (!user) return null;
 
         const lastMessage = lastMessagesMap.get(partnerId);
+        // unreadCountsMap contains { senderId: count } where senderId sent messages TO currentUserId
+        // So for a chat with partnerId, we look up how many unread messages partnerId sent to currentUserId
+        // This should ONLY be > 0 if partnerId sent messages to currentUserId (currentUserId is the recipient)
         const unreadCount = unreadCountsMap.get(partnerId) || 0;
+        
+        // Debug: Log unread count for this chat
+        if (unreadCount > 0) {
+          console.log(`[ChatList] User ${currentUserId} has ${unreadCount} unread messages from ${partnerId} (${user.display_name || user.username})`);
+        }
 
         return {
           id: user.id,

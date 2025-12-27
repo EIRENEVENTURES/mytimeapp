@@ -120,7 +120,11 @@ export async function incrementUnreadCount(recipientId: string, senderId: string
   const client = getRedisClient();
   if (!client) return;
 
+  // Key format: unread:RECIPIENT_ID:SENDER_ID
+  // This means: "How many unread messages did SENDER_ID send to RECIPIENT_ID"
+  // Only RECIPIENT_ID should see this count in their badge
   const key = `unread:${recipientId}:${senderId}`;
+  console.log(`[Redis] Incrementing unread count: key=${key} (recipient=${recipientId}, sender=${senderId})`);
   await client.incr(key);
   await client.expire(key, 86400 * 7); // Expire after 7 days
 }
@@ -146,21 +150,31 @@ export async function getAllUnreadCounts(recipientId: string): Promise<Map<strin
   const client = getRedisClient();
   if (!client) return new Map();
 
+  // Pattern: unread:RECIPIENT_ID:*
+  // This finds all keys where recipientId is the recipient
+  // Returns Map<senderId, count> - how many unread messages each sender sent to this recipient
   const pattern = `unread:${recipientId}:*`;
   const keys = await client.keys(pattern);
   const counts = new Map<string, number>();
 
-  if (keys.length === 0) return counts;
+  if (keys.length === 0) {
+    console.log(`[Redis] No unread counts found for recipient ${recipientId}`);
+    return counts;
+  }
 
   const values = await client.mget(...keys);
   keys.forEach((key, index) => {
+    // Key format: unread:RECIPIENT_ID:SENDER_ID
+    // Extract senderId (the person who sent the messages)
     const senderId = key.split(':')[2];
     const count = values[index] ? parseInt(values[index]!, 10) : 0;
     if (count > 0) {
       counts.set(senderId, count);
+      console.log(`[Redis] Found ${count} unread messages from ${senderId} to ${recipientId}`);
     }
   });
 
+  console.log(`[Redis] Total unread counts for recipient ${recipientId}:`, Array.from(counts.entries()));
   return counts;
 }
 
