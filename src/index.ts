@@ -2,13 +2,25 @@ import express from 'express';
 import cors from 'cors';
 import dotenv from 'dotenv';
 import { join } from 'path';
+import { createServer } from 'http';
+import { Server } from 'socket.io';
 import authRouter from './auth';
 import userRouter from './routes/user';
 import messagesRouter from './routes/messages';
+import { setupSocketIO } from './socket';
 
 dotenv.config();
 
 const app = express();
+const httpServer = createServer(app);
+const io = new Server(httpServer, {
+  cors: {
+    origin: '*',
+    credentials: true,
+  },
+  transports: ['websocket', 'polling'],
+});
+
 const port = process.env.PORT || 4000;
 
 app.use(cors({ origin: '*', credentials: true }));
@@ -44,7 +56,26 @@ app.use('/auth', authRouter);
 app.use('/user', userRouter);
 app.use('/messages', messagesRouter);
 
-app.listen(port, () => {
+// Setup Socket.IO
+setupSocketIO(io);
+
+// Initialize Redis connection
+import { getRedisClient } from './redis';
+getRedisClient();
+
+httpServer.listen(port, () => {
   // eslint-disable-next-line no-console
   console.log(`API listening on http://localhost:${port}`);
+  console.log(`WebSocket server ready`);
+});
+
+// Graceful shutdown
+process.on('SIGTERM', async () => {
+  console.log('SIGTERM received, shutting down gracefully');
+  const { closeRedis } = await import('./redis');
+  await closeRedis();
+  httpServer.close(() => {
+    console.log('HTTP server closed');
+    process.exit(0);
+  });
 });

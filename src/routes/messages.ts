@@ -5,6 +5,13 @@ import { pool } from '../db';
 import { writeFile, mkdir } from 'fs/promises';
 import { join } from 'path';
 import { existsSync } from 'fs';
+import { emitMessageToUsers } from '../socket';
+import {
+  isUserOnline,
+  setUserPresence,
+  incrementUnreadCount,
+  resetUnreadCount,
+} from '../redis';
 
 const router = Router();
 
@@ -41,24 +48,9 @@ async function uploadToBlobStorage(fileName: string, buffer: Buffer, contentType
   }
 }
 
-// In-memory store for typing status (userId -> { typingUserId: timestamp })
-// In production, consider using Redis or a database table
+// Typing status moved to Redis (see redis.ts)
+// In-memory store kept as fallback only (deprecated)
 const typingStatus = new Map<string, Map<string, number>>();
-
-// Clean up stale typing status (older than 3 seconds)
-setInterval(() => {
-  const now = Date.now();
-  typingStatus.forEach((userMap, userId) => {
-    userMap.forEach((timestamp, typingUserId) => {
-      if (now - timestamp > 3000) {
-        userMap.delete(typingUserId);
-      }
-    });
-    if (userMap.size === 0) {
-      typingStatus.delete(userId);
-    }
-  });
-}, 1000);
 
 /**
  * GET /messages/conversation/:userId
@@ -294,59 +286,118 @@ router.get('/conversation/:userId', authenticateToken, async (req: Request, res:
 router.post('/', authenticateToken, async (req: Request, res: Response) => {
   try {
     const senderId = req.user!.id;
-    const { recipientId, content, replyToMessageId } = req.body;
+    const { recipientId, content, replyToMessageId, idempotencyKey } = req.body;
 
     if (!recipientId || !content || !content.trim()) {
       return res.status(400).json({ message: 'Recipient ID and content are required' });
     }
 
-    // Check if recipient is online (active within last 2 minutes)
-    const recipientCheck = await pool.query(
-      `SELECT id, last_seen_at FROM users WHERE id = $1`,
-      [recipientId]
-    );
-    
+    // Idempotency check: if idempotencyKey provided, check for existing message
+    if (idempotencyKey) {
+      const existing = await pool.query(
+        `SELECT id, sender_id, recipient_id, content, status, created_at, reply_to_message_id
+         FROM messages WHERE idempotency_key = $1`,
+        [idempotencyKey]
+      );
+      if (existing.rows.length > 0) {
+        const msg = existing.rows[0];
+        return res.json({
+          message: {
+            id: msg.id,
+            senderId: msg.sender_id,
+            recipientId: msg.recipient_id,
+            content: msg.content,
+            status: msg.status,
+            createdAt: msg.created_at.toISOString(),
+            replyToMessageId: msg.reply_to_message_id,
+          },
+        });
+      }
+    }
+
+    // Check if recipient exists (minimal query)
+    const recipientCheck = await pool.query(`SELECT id FROM users WHERE id = $1`, [recipientId]);
     if (recipientCheck.rows.length === 0) {
       return res.status(404).json({ message: 'Recipient not found' });
     }
 
-    const recipient = recipientCheck.rows[0];
-    let initialStatus = 'sent'; // Default to sent for offline users
-    
-    // Check if recipient is online (active within last 2 minutes)
-    if (recipient.last_seen_at) {
-      const lastSeen = new Date(recipient.last_seen_at as Date).getTime();
-      const now = Date.now();
-      const diffMinutes = (now - lastSeen) / (1000 * 60);
-      
-      if (diffMinutes <= 2) {
-        // Recipient is online, mark as delivered
-        initialStatus = 'delivered';
-      }
-    }
+    // Check presence via Redis (faster than DB query)
+    const recipientOnline = await isUserOnline(recipientId);
+    const initialStatus = recipientOnline ? 'delivered' : 'sent';
 
-    // Insert message with appropriate status
+    // Insert message (append-only write) - ensure idempotency_key column exists
+    await pool.query(`
+      ALTER TABLE messages 
+      ADD COLUMN IF NOT EXISTS idempotency_key VARCHAR(255) UNIQUE
+    `).catch(() => {
+      // Column might already exist, ignore error
+    });
+
     const { rows } = await pool.query(
-      `INSERT INTO messages (sender_id, recipient_id, content, status, reply_to_message_id)
-       VALUES ($1, $2, $3, $4, $5)
+      `INSERT INTO messages (sender_id, recipient_id, content, status, reply_to_message_id, idempotency_key)
+       VALUES ($1, $2, $3, $4, $5, $6)
        RETURNING id, sender_id, recipient_id, content, status, created_at, reply_to_message_id`,
-      [senderId, recipientId, content.trim(), initialStatus, replyToMessageId || null],
+      [
+        senderId,
+        recipientId,
+        content.trim(),
+        initialStatus,
+        replyToMessageId || null,
+        idempotencyKey || null,
+      ],
     );
 
     const message = rows[0];
 
+    // Update unread counter in Redis (async, non-blocking)
+    if (!recipientOnline) {
+      incrementUnreadCount(recipientId, senderId).catch((err) =>
+        console.error('Failed to increment unread count:', err)
+      );
+    }
+
+    // Format minimal message data for WebSocket (IDs only for fan-out)
+    const messageData = {
+      id: message.id,
+      senderId: message.sender_id,
+      recipientId: message.recipient_id,
+      content: message.content,
+      status: message.status,
+      createdAt: message.created_at.toISOString(),
+      replyToMessageId: message.reply_to_message_id,
+    };
+
+    // Emit via WebSocket AFTER persistence (best effort, non-blocking)
+    // Use minimal payload: only message ID for initial notification
+    emitMessageToUsers(senderId, recipientId, { id: message.id }); // Minimal payload
+
     return res.json({
-      message: {
-        id: message.id,
-        senderId: message.sender_id,
-        recipientId: message.recipient_id,
-        content: message.content,
-        status: message.status,
-        createdAt: message.created_at,
-        replyToMessageId: message.reply_to_message_id,
-      },
+      message: messageData,
     });
-  } catch (err) {
+  } catch (err: any) {
+    // Handle unique constraint violation (idempotency key collision)
+    if (err.code === '23505' && err.constraint?.includes('idempotency_key')) {
+      // Message already exists, fetch and return it
+      const existing = await pool.query(
+        `SELECT id, sender_id, recipient_id, content, status, created_at, reply_to_message_id
+         FROM messages WHERE idempotency_key = $1`,
+        [req.body.idempotencyKey]
+      );
+      if (existing.rows.length > 0) {
+        const msg = existing.rows[0];
+        return res.json({
+          message: {
+            id: msg.id,
+            senderId: msg.sender_id,
+            recipientId: msg.recipient_id,
+            content: msg.content,
+            status: msg.status,
+            createdAt: msg.created_at.toISOString(),
+            replyToMessageId: msg.reply_to_message_id,
+          },
+        });
+      }
+    }
     console.error('Send message error', err);
     return res.status(500).json({ message: 'Internal server error' });
   }
@@ -593,7 +644,16 @@ router.post('/upload', authenticateToken, async (req: Request, res: Response) =>
 router.get('/unread-count', authenticateToken, async (req: Request, res: Response) => {
   try {
     const currentUserId = req.user!.id;
+    const { getAllUnreadCounts } = await import('../redis');
 
+    // Try Redis first (fast)
+    const redisCounts = await getAllUnreadCounts(currentUserId);
+    if (redisCounts.size > 0) {
+      const total = Array.from(redisCounts.values()).reduce((sum, count) => sum + count, 0);
+      return res.json({ unreadCount: total });
+    }
+
+    // Fallback to DB if Redis unavailable
     const { rows } = await pool.query(
       `SELECT COUNT(*) as unread_count
        FROM messages
@@ -603,10 +663,74 @@ router.get('/unread-count', authenticateToken, async (req: Request, res: Respons
     );
 
     const unreadCount = parseInt(rows[0].unread_count, 10) || 0;
-
     return res.json({ unreadCount });
   } catch (err) {
     console.error('Get unread count error', err);
+    return res.status(500).json({ message: 'Internal server error' });
+  }
+});
+
+/**
+ * GET /messages/reconcile
+ * Reconciliation endpoint for clients to sync messages
+ * Returns messages since a given timestamp or message ID
+ */
+router.get('/reconcile', authenticateToken, async (req: Request, res: Response) => {
+  try {
+    const currentUserId = req.user!.id;
+    const since = req.query.since as string; // Message ID or timestamp
+    const limit = Math.min(parseInt(req.query.limit as string) || 50, 100);
+
+    let query = `
+      SELECT 
+        m.id,
+        m.sender_id,
+        m.recipient_id,
+        m.content,
+        m.status,
+        m.created_at,
+        m.reply_to_message_id,
+        m.has_attachments,
+        COALESCE(m.is_forwarded, FALSE) as is_forwarded,
+        COALESCE(m.is_edited, FALSE) as is_edited
+      FROM messages m
+      WHERE (m.sender_id = $1 OR m.recipient_id = $1)
+    `;
+    const params: any[] = [currentUserId];
+
+    if (since) {
+      // If since is a UUID (message ID), use it
+      if (since.match(/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i)) {
+        query += ` AND m.id > $2 AND m.created_at > (SELECT created_at FROM messages WHERE id = $2)`;
+        params.push(since);
+      } else {
+        // Otherwise treat as timestamp
+        query += ` AND m.created_at > $2::timestamptz`;
+        params.push(since);
+      }
+    }
+
+    query += ` ORDER BY m.created_at ASC LIMIT $${params.length + 1}`;
+    params.push(limit);
+
+    const { rows } = await pool.query(query, params);
+
+    return res.json({
+      messages: rows.map((row) => ({
+        id: row.id,
+        senderId: row.sender_id,
+        recipientId: row.recipient_id,
+        content: row.content,
+        status: row.status,
+        createdAt: row.created_at.toISOString(),
+        replyToMessageId: row.reply_to_message_id,
+        isForwarded: row.is_forwarded,
+        isEdited: row.is_edited,
+      })),
+      hasMore: rows.length === limit,
+    });
+  } catch (err) {
+    console.error('Reconcile error', err);
     return res.status(500).json({ message: 'Internal server error' });
   }
 });
