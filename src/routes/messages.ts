@@ -198,6 +198,32 @@ router.get('/conversation/:userId', authenticateToken, async (req: Request, res:
       starredRows.forEach((s) => starredSet.add(s.message_id));
     }
 
+    // Get pinned status for current user
+    let pinnedSet = new Set();
+    if (messageIds.length > 0) {
+      // Ensure pinned_messages table exists
+      await pool.query(`
+        CREATE TABLE IF NOT EXISTS pinned_messages (
+          id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+          message_id UUID NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
+          user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+          created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+          UNIQUE (message_id, user_id)
+        )
+      `).catch(() => {
+        // Table might already exist
+      });
+
+      const { rows: pinnedRows } = await pool.query(
+        `SELECT message_id
+         FROM pinned_messages
+         WHERE message_id = ANY($1::uuid[])
+           AND user_id = $2`,
+        [messageIds, currentUserId],
+      );
+      pinnedRows.forEach((p) => pinnedSet.add(p.message_id));
+    }
+
     // Get the oldest message timestamp for next cursor
     const nextCursor = hasMore && messages.length > 0 
       ? messages[0].created_at 
@@ -216,6 +242,7 @@ router.get('/conversation/:userId', authenticateToken, async (req: Request, res:
         reactions: reactionsMap.get(m.id) || [],
         isStarred: starredSet.has(m.id),
         isForwarded: m.is_forwarded || false,
+        isPinned: pinnedSet.has(m.id),
       })),
       hasMore,
       nextCursor,
@@ -1057,6 +1084,157 @@ router.post('/forward', authenticateToken, async (req: Request, res: Response) =
     });
   } catch (err) {
     console.error('Forward messages error', err);
+    return res.status(500).json({ message: 'Internal server error' });
+  }
+});
+
+/**
+ * PATCH /messages/:id
+ * Edit a message (only within 15 minutes of sending)
+ */
+router.patch('/:id', authenticateToken, async (req: Request, res: Response) => {
+  try {
+    const currentUserId = req.user!.id;
+    const messageId = req.params.id;
+    const { content } = req.body;
+
+    if (!content || !content.trim()) {
+      return res.status(400).json({ message: 'Content is required' });
+    }
+
+    // Get the message
+    const { rows: messageRows } = await pool.query(
+      `SELECT id, sender_id, created_at, has_attachments
+       FROM messages
+       WHERE id = $1`,
+      [messageId]
+    );
+
+    if (messageRows.length === 0) {
+      return res.status(404).json({ message: 'Message not found' });
+    }
+
+    const message = messageRows[0];
+
+    // Check if user is the sender
+    if (message.sender_id !== currentUserId) {
+      return res.status(403).json({ message: 'You can only edit your own messages' });
+    }
+
+    // Check if message is within 15 minutes
+    const messageTime = new Date(message.created_at as Date).getTime();
+    const now = Date.now();
+    const fifteenMinutes = 15 * 60 * 1000;
+    if ((now - messageTime) > fifteenMinutes) {
+      return res.status(400).json({ message: 'You can only edit messages within 15 minutes of sending' });
+    }
+
+    // Check if message has attachments without caption (content is just filename)
+    if (message.has_attachments) {
+      const { rows: attachmentRows } = await pool.query(
+        `SELECT file_name FROM message_attachments WHERE message_id = $1`,
+        [messageId]
+      );
+      const isJustFilename = attachmentRows.some(att => message.content === att.file_name);
+      if (isJustFilename && !content.trim()) {
+        return res.status(400).json({ message: 'Cannot edit messages with attachments that have no caption' });
+      }
+    }
+
+    // Update the message
+    const { rows: updatedRows } = await pool.query(
+      `UPDATE messages 
+       SET content = $1, updated_at = NOW()
+       WHERE id = $2
+       RETURNING id, sender_id, recipient_id, content, status, created_at, reply_to_message_id`,
+      [content.trim(), messageId]
+    );
+
+    return res.json({
+      message: {
+        id: updatedRows[0].id,
+        senderId: updatedRows[0].sender_id,
+        recipientId: updatedRows[0].recipient_id,
+        content: updatedRows[0].content,
+        status: updatedRows[0].status,
+        createdAt: updatedRows[0].created_at,
+        replyToMessageId: updatedRows[0].reply_to_message_id,
+      },
+    });
+  } catch (err) {
+    console.error('Edit message error', err);
+    return res.status(500).json({ message: 'Internal server error' });
+  }
+});
+
+/**
+ * POST /messages/:id/pin
+ * Pin a message
+ */
+router.post('/:id/pin', authenticateToken, async (req: Request, res: Response) => {
+  try {
+    const currentUserId = req.user!.id;
+    const messageId = req.params.id;
+
+    // Ensure pinned_messages table exists
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS pinned_messages (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        message_id UUID NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
+        user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        UNIQUE (message_id, user_id)
+      )
+    `).catch(() => {
+      // Table might already exist
+    });
+
+    // Check if message exists and user has access
+    const { rows: messageRows } = await pool.query(
+      `SELECT m.id, m.sender_id, m.recipient_id
+       FROM messages m
+       WHERE m.id = $1 AND (m.sender_id = $2 OR m.recipient_id = $2)`,
+      [messageId, currentUserId]
+    );
+
+    if (messageRows.length === 0) {
+      return res.status(404).json({ message: 'Message not found' });
+    }
+
+    // Insert or update pinned message
+    await pool.query(
+      `INSERT INTO pinned_messages (message_id, user_id)
+       VALUES ($1, $2)
+       ON CONFLICT (message_id, user_id) DO NOTHING`,
+      [messageId, currentUserId]
+    );
+
+    return res.json({ success: true, isPinned: true });
+  } catch (err) {
+    console.error('Pin message error', err);
+    return res.status(500).json({ message: 'Internal server error' });
+  }
+});
+
+/**
+ * POST /messages/:id/unpin
+ * Unpin a message
+ */
+router.post('/:id/unpin', authenticateToken, async (req: Request, res: Response) => {
+  try {
+    const currentUserId = req.user!.id;
+    const messageId = req.params.id;
+
+    // Delete pinned message
+    await pool.query(
+      `DELETE FROM pinned_messages 
+       WHERE message_id = $1 AND user_id = $2`,
+      [messageId, currentUserId]
+    );
+
+    return res.json({ success: true, isPinned: false });
+  } catch (err) {
+    console.error('Unpin message error', err);
     return res.status(500).json({ message: 'Internal server error' });
   }
 });
