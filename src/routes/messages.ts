@@ -80,6 +80,14 @@ router.get('/conversation/:userId', authenticateToken, async (req: Request, res:
       // Column might already exist, ignore error
     });
 
+    // Ensure is_edited column exists (for backward compatibility)
+    await pool.query(`
+      ALTER TABLE messages 
+      ADD COLUMN IF NOT EXISTS is_edited BOOLEAN NOT NULL DEFAULT FALSE
+    `).catch(() => {
+      // Column might already exist, ignore error
+    });
+
     let query = `
       SELECT 
         m.id,
@@ -90,7 +98,8 @@ router.get('/conversation/:userId', authenticateToken, async (req: Request, res:
         m.created_at,
         m.reply_to_message_id,
         m.has_attachments,
-        COALESCE(m.is_forwarded, FALSE) as is_forwarded
+        COALESCE(m.is_forwarded, FALSE) as is_forwarded,
+        COALESCE(m.is_edited, FALSE) as is_edited
        FROM messages m
        WHERE (m.sender_id = $1 AND m.recipient_id = $2)
           OR (m.sender_id = $2 AND m.recipient_id = $1)
@@ -242,6 +251,7 @@ router.get('/conversation/:userId', authenticateToken, async (req: Request, res:
         reactions: reactionsMap.get(m.id) || [],
         isStarred: starredSet.has(m.id),
         isForwarded: m.is_forwarded || false,
+        isEdited: m.is_edited || false,
         isPinned: pinnedSet.has(m.id),
       })),
       hasMore,
@@ -1141,12 +1151,20 @@ router.patch('/:id', authenticateToken, async (req: Request, res: Response) => {
       }
     }
 
+    // Ensure is_edited column exists (for backward compatibility)
+    await pool.query(`
+      ALTER TABLE messages 
+      ADD COLUMN IF NOT EXISTS is_edited BOOLEAN NOT NULL DEFAULT FALSE
+    `).catch(() => {
+      // Column might already exist, ignore error
+    });
+
     // Update the message
     const { rows: updatedRows } = await pool.query(
       `UPDATE messages 
-       SET content = $1, updated_at = NOW()
+       SET content = $1, updated_at = NOW(), is_edited = TRUE
        WHERE id = $2
-       RETURNING id, sender_id, recipient_id, content, status, created_at, reply_to_message_id`,
+       RETURNING id, sender_id, recipient_id, content, status, created_at, reply_to_message_id, is_edited`,
       [content.trim(), messageId]
     );
 
@@ -1159,6 +1177,7 @@ router.patch('/:id', authenticateToken, async (req: Request, res: Response) => {
         status: updatedRows[0].status,
         createdAt: updatedRows[0].created_at,
         replyToMessageId: updatedRows[0].reply_to_message_id,
+        isEdited: updatedRows[0].is_edited || false,
       },
     });
   } catch (err) {
