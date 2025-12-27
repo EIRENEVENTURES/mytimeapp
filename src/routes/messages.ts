@@ -72,6 +72,14 @@ router.get('/conversation/:userId', authenticateToken, async (req: Request, res:
     );
 
     // Build cursor-based query - load latest messages first, then reverse for chronological order
+    // Ensure is_forwarded column exists (for backward compatibility)
+    await pool.query(`
+      ALTER TABLE messages 
+      ADD COLUMN IF NOT EXISTS is_forwarded BOOLEAN NOT NULL DEFAULT FALSE
+    `).catch(() => {
+      // Column might already exist, ignore error
+    });
+
     let query = `
       SELECT 
         m.id,
@@ -81,7 +89,8 @@ router.get('/conversation/:userId', authenticateToken, async (req: Request, res:
         m.status,
         m.created_at,
         m.reply_to_message_id,
-        m.has_attachments
+        m.has_attachments,
+        COALESCE(m.is_forwarded, FALSE) as is_forwarded
        FROM messages m
        WHERE (m.sender_id = $1 AND m.recipient_id = $2)
           OR (m.sender_id = $2 AND m.recipient_id = $1)
@@ -206,6 +215,7 @@ router.get('/conversation/:userId', authenticateToken, async (req: Request, res:
         attachments: attachmentsMap.get(m.id) || [],
         reactions: reactionsMap.get(m.id) || [],
         isStarred: starredSet.has(m.id),
+        isForwarded: m.is_forwarded || false,
       })),
       hasMore,
       nextCursor,
@@ -984,10 +994,18 @@ router.post('/forward', authenticateToken, async (req: Request, res: Response) =
     // Forward each message
     for (const originalMessage of messagesToForward) {
       // Create new message with forwarded content
+      // First, ensure is_forwarded column exists (for backward compatibility)
+      await pool.query(`
+        ALTER TABLE messages 
+        ADD COLUMN IF NOT EXISTS is_forwarded BOOLEAN NOT NULL DEFAULT FALSE
+      `).catch(() => {
+        // Column might already exist, ignore error
+      });
+
       const { rows: newMessageRows } = await pool.query(
-        `INSERT INTO messages (sender_id, recipient_id, content, status, reply_to_message_id, has_attachments)
-         VALUES ($1, $2, $3, $4, NULL, $5)
-         RETURNING id, sender_id, recipient_id, content, status, created_at, reply_to_message_id`,
+        `INSERT INTO messages (sender_id, recipient_id, content, status, reply_to_message_id, has_attachments, is_forwarded)
+         VALUES ($1, $2, $3, $4, NULL, $5, TRUE)
+         RETURNING id, sender_id, recipient_id, content, status, created_at, reply_to_message_id, is_forwarded`,
         [
           senderId,
           recipientId,
@@ -1028,6 +1046,7 @@ router.post('/forward', authenticateToken, async (req: Request, res: Response) =
         status: newMessage.status,
         createdAt: newMessage.created_at,
         replyToMessageId: newMessage.reply_to_message_id,
+        isForwarded: newMessage.is_forwarded || true,
       });
     }
 
