@@ -48,6 +48,14 @@ router.get('/conversation/:userId', authenticateToken, async (req: Request, res:
       [currentUserId, otherUserId],
     );
 
+    // Reset unread count for this conversation when messages are marked as read
+    if (readResult.rows.length > 0) {
+      const { resetUnreadCount } = await import('../redis');
+      resetUnreadCount(currentUserId, otherUserId).catch((err) =>
+        console.error('Failed to reset unread count:', err)
+      );
+    }
+
     // Build cursor-based query - load latest messages first, then reverse for chronological order
 
     // Optimized: Use UNION to leverage separate indexes instead of OR

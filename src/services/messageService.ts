@@ -82,12 +82,13 @@ export async function createMessage(params: CreateMessageParams): Promise<Messag
 
     const message = rows[0];
 
-    // Update unread counter (async, non-blocking)
-    if (!recipientOnline) {
-      incrementUnreadCount(recipientId, senderId).catch((err) =>
-        console.error('Failed to increment unread count:', err)
-      );
-    }
+    // Update unread counter for recipient (async, non-blocking)
+    // IMPORTANT: Increment unread count for the RECIPIENT, not the sender
+    // A message is unread until the recipient actually reads it, regardless of online status
+    // "delivered" just means it reached the device, but it's still unread until opened
+    incrementUnreadCount(recipientId, senderId).catch((err) =>
+      console.error('Failed to increment unread count:', err)
+    );
 
     return {
       id: message.id,
