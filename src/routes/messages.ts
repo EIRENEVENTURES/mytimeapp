@@ -60,6 +60,7 @@ router.get('/conversation/:userId', authenticateToken, async (req: Request, res:
 
     // Optimized: Use UNION to leverage separate indexes instead of OR
     // This allows index-only scans on both branches
+    // Exclude messages deleted by current user (soft delete)
     let query = `
       (
         SELECT 
@@ -74,7 +75,9 @@ router.get('/conversation/:userId', authenticateToken, async (req: Request, res:
           COALESCE(m.is_forwarded, FALSE) as is_forwarded,
           COALESCE(m.is_edited, FALSE) as is_edited
         FROM messages m
+        LEFT JOIN deleted_messages dm ON m.id = dm.message_id AND dm.user_id = $1
         WHERE m.sender_id = $1 AND m.recipient_id = $2
+          AND dm.id IS NULL
     `;
     
     const params: any[] = [currentUserId, otherUserId];
@@ -118,7 +121,9 @@ router.get('/conversation/:userId', authenticateToken, async (req: Request, res:
           COALESCE(m.is_forwarded, FALSE) as is_forwarded,
           COALESCE(m.is_edited, FALSE) as is_edited
         FROM messages m
-        WHERE m.sender_id = $2 AND m.recipient_id = $1`;
+        LEFT JOIN deleted_messages dm ON m.id = dm.message_id AND dm.user_id = $1
+        WHERE m.sender_id = $2 AND m.recipient_id = $1
+          AND dm.id IS NULL`;
     
     // Add same cursor condition for second branch
     if (before && before.match(/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i)) {
@@ -285,6 +290,18 @@ router.post('/', authenticateToken, async (req: Request, res: Response) => {
 
     if (!recipientId || !content || !content.trim()) {
       return res.status(400).json({ message: 'Recipient ID and content are required' });
+    }
+
+    // Check if user is blocked
+    const blockedCheck = await pool.query(
+      `SELECT 1 FROM blocked_users 
+       WHERE (blocker_id = $1 AND blocked_id = $2) 
+          OR (blocker_id = $2 AND blocked_id = $1)`,
+      [senderId, recipientId]
+    );
+
+    if (blockedCheck.rows.length > 0) {
+      return res.status(403).json({ message: 'Cannot send message to this user' });
     }
 
     // Use message service for business logic
@@ -780,14 +797,20 @@ router.get('/chats', authenticateToken, async (req: Request, res: Response) => {
 
     // Optimized: Split into multiple cheap queries to avoid GROUP BY and complex CTEs
     // Query 1: Get distinct conversation partners (index scan)
+    // Exclude blocked users
     const partnersResult = await pool.query(
       `SELECT DISTINCT
         CASE 
-          WHEN sender_id = $1 THEN recipient_id
-          ELSE sender_id
+          WHEN m.sender_id = $1 THEN m.recipient_id
+          ELSE m.sender_id
         END as partner_id
-      FROM messages
-      WHERE sender_id = $1 OR recipient_id = $1`,
+      FROM messages m
+      LEFT JOIN blocked_users bu ON (
+        (bu.blocker_id = $1 AND bu.blocked_id = CASE WHEN m.sender_id = $1 THEN m.recipient_id ELSE m.sender_id END)
+        OR (bu.blocked_id = $1 AND bu.blocker_id = CASE WHEN m.sender_id = $1 THEN m.recipient_id ELSE m.sender_id END)
+      )
+      WHERE (m.sender_id = $1 OR m.recipient_id = $1)
+        AND bu.id IS NULL`,
       [currentUserId],
     );
     
@@ -1503,6 +1526,222 @@ router.post('/:id/unpin', authenticateToken, async (req: Request, res: Response)
     return res.json({ success: true, isPinned: false });
   } catch (err) {
     console.error('Unpin message error', err);
+    return res.status(500).json({ message: 'Internal server error' });
+  }
+});
+
+/**
+ * DELETE /messages/:messageId
+ * Delete a message (for me only - soft delete)
+ */
+router.delete('/:messageId', authenticateToken, async (req: Request, res: Response) => {
+  try {
+    const currentUserId = req.user!.id;
+    const messageId = req.params.messageId;
+
+    // Check if message exists and user has access
+    const { rows: messageRows } = await pool.query(
+      `SELECT id, sender_id, recipient_id 
+       FROM messages 
+       WHERE id = $1 AND (sender_id = $2 OR recipient_id = $2)`,
+      [messageId, currentUserId]
+    );
+
+    if (messageRows.length === 0) {
+      return res.status(404).json({ message: 'Message not found' });
+    }
+
+    const message = messageRows[0];
+
+    // Ensure deleted_messages table exists for soft delete tracking
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS deleted_messages (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        message_id UUID NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
+        user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        deleted_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        UNIQUE (message_id, user_id)
+      )
+    `).catch(() => {
+      // Table might already exist
+    });
+
+    // Soft delete: Mark message as deleted for this user
+    await pool.query(
+      `INSERT INTO deleted_messages (message_id, user_id)
+       VALUES ($1, $2)
+       ON CONFLICT (message_id, user_id) DO NOTHING`,
+      [messageId, currentUserId]
+    );
+
+    // Notify the other user via WebSocket
+    const otherUserId = message.sender_id === currentUserId 
+      ? message.recipient_id 
+      : message.sender_id;
+    
+    const { getIoInstance } = await import('../socket');
+    const io = getIoInstance();
+    if (io) {
+      io.to(`user:${otherUserId}`).emit('message:deleted', {
+        messageId,
+        deletedBy: currentUserId,
+      });
+    }
+
+    return res.json({ success: true, deleted: true });
+  } catch (err) {
+    console.error('Delete message error', err);
+    return res.status(500).json({ message: 'Internal server error' });
+  }
+});
+
+/**
+ * DELETE /messages/:messageId/for-everyone
+ * Delete a message for everyone (hard delete - only if sender and within time limit)
+ */
+router.delete('/:messageId/for-everyone', authenticateToken, async (req: Request, res: Response) => {
+  try {
+    const currentUserId = req.user!.id;
+    const messageId = req.params.messageId;
+
+    // Check if message exists and user is the sender
+    const { rows: messageRows } = await pool.query(
+      `SELECT id, sender_id, recipient_id, created_at 
+       FROM messages 
+       WHERE id = $1 AND sender_id = $2`,
+      [messageId, currentUserId]
+    );
+
+    if (messageRows.length === 0) {
+      return res.status(404).json({ message: 'Message not found or you are not the sender' });
+    }
+
+    const message = messageRows[0];
+    const messageAge = Date.now() - new Date(message.created_at).getTime();
+    const fifteenMinutes = 15 * 60 * 1000;
+
+    // Only allow delete for everyone within 15 minutes (WhatsApp pattern)
+    if (messageAge > fifteenMinutes) {
+      return res.status(403).json({ 
+        message: 'Cannot delete message for everyone after 15 minutes' 
+      });
+    }
+
+    // Hard delete: Remove message from database
+    await pool.query(
+      `DELETE FROM messages WHERE id = $1`,
+      [messageId]
+    );
+
+    // Notify the recipient via WebSocket
+    const { getIoInstance } = await import('../socket');
+    const io = getIoInstance();
+    if (io) {
+      io.to(`user:${message.recipient_id}`).emit('message:deleted', {
+        messageId,
+        deletedBy: currentUserId,
+        deletedForEveryone: true,
+      });
+    }
+
+    return res.json({ success: true, deleted: true, deletedForEveryone: true });
+  } catch (err) {
+    console.error('Delete message for everyone error', err);
+    return res.status(500).json({ message: 'Internal server error' });
+  }
+});
+
+/**
+ * POST /messages/batch-delete
+ * Delete multiple messages at once
+ */
+router.post('/batch-delete', authenticateToken, async (req: Request, res: Response) => {
+  try {
+    const currentUserId = req.user!.id;
+    const { messageIds, deleteForEveryone } = req.body;
+
+    if (!Array.isArray(messageIds) || messageIds.length === 0) {
+      return res.status(400).json({ message: 'Message IDs array is required' });
+    }
+
+    if (deleteForEveryone) {
+      // Delete for everyone: Only if user is sender and within 15 minutes
+      const { rows: messages } = await pool.query(
+        `SELECT id, sender_id, recipient_id, created_at 
+         FROM messages 
+         WHERE id = ANY($1::uuid[]) AND sender_id = $2`,
+        [messageIds, currentUserId]
+      );
+
+      const now = Date.now();
+      const fifteenMinutes = 15 * 60 * 1000;
+      const deletableMessages = messages.filter(
+        (m) => now - new Date(m.created_at).getTime() <= fifteenMinutes
+      );
+
+      if (deletableMessages.length === 0) {
+        return res.status(403).json({ 
+          message: 'No messages can be deleted for everyone (time limit exceeded or not sender)' 
+        });
+      }
+
+      const deletableIds = deletableMessages.map((m) => m.id);
+      await pool.query(
+        `DELETE FROM messages WHERE id = ANY($1::uuid[])`,
+        [deletableIds]
+      );
+
+      // Notify recipients
+      const recipients = new Set(deletableMessages.map((m) => m.recipient_id));
+      const { getIoInstance } = await import('../socket');
+      const io = getIoInstance();
+      if (io) {
+        recipients.forEach((recipientId) => {
+          io.to(`user:${recipientId}`).emit('message:deleted', {
+            messageIds: deletableIds,
+            deletedBy: currentUserId,
+            deletedForEveryone: true,
+          });
+        });
+      }
+
+      return res.json({ 
+        success: true, 
+        deleted: deletableIds.length,
+        total: messageIds.length 
+      });
+    } else {
+      // Delete for me: Soft delete
+      await pool.query(`
+        CREATE TABLE IF NOT EXISTS deleted_messages (
+          id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+          message_id UUID NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
+          user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+          deleted_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+          UNIQUE (message_id, user_id)
+        )
+      `).catch(() => {
+        // Table might already exist
+      });
+
+      // Batch insert deleted messages
+      const values = messageIds.map((id: string, index: number) => 
+        `($${index * 2 + 1}::uuid, $${index * 2 + 2}::uuid)`
+      ).join(', ');
+      
+      const params = messageIds.flatMap((id: string) => [id, currentUserId]);
+      
+      await pool.query(
+        `INSERT INTO deleted_messages (message_id, user_id)
+         VALUES ${values}
+         ON CONFLICT (message_id, user_id) DO NOTHING`,
+        params
+      );
+
+      return res.json({ success: true, deleted: messageIds.length });
+    }
+  } catch (err) {
+    console.error('Batch delete error', err);
     return res.status(500).json({ message: 'Internal server error' });
   }
 });

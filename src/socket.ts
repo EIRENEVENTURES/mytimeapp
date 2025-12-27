@@ -242,6 +242,13 @@ export function setupSocketIO(io: Server): void {
 }
 
 /**
+ * Get the Socket.IO instance (for use in routes)
+ */
+export function getIoInstance(): Server | null {
+  return ioInstance;
+}
+
+/**
  * Emit message to users (called from REST API routes)
  * Uses minimal payload (message ID only) - client fetches full message if needed
  */
