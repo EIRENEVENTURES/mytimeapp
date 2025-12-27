@@ -35,15 +35,17 @@ const conversationRooms = new Map<string, Set<string>>();
  */
 function authenticateSocket(socket: AuthenticatedSocket, token: string): string | null {
   try {
-    const jwtSecret = process.env.JWT_SECRET;
+    // Use JWT_ACCESS_SECRET to match the secret used for signing access tokens
+    const jwtSecret = process.env.JWT_ACCESS_SECRET;
     if (!jwtSecret) {
-      console.error('JWT_SECRET not configured');
+      console.error('JWT_ACCESS_SECRET not configured');
       return null;
     }
 
-    const decoded = jwt.verify(token, jwtSecret) as { id: string; email: string };
-    socket.userId = decoded.id;
-    return decoded.id;
+    // Token payload uses 'sub' for user ID (not 'id'), matching auth.ts structure
+    const decoded = jwt.verify(token, jwtSecret) as { sub: string; email: string; role: string };
+    socket.userId = decoded.sub;
+    return decoded.sub;
   } catch (error) {
     console.error('Socket authentication error:', error);
     return null;
