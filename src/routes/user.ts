@@ -2,8 +2,41 @@
 import { Router, Request, Response } from 'express';
 import { authenticateToken } from '../middleware/auth';
 import { pool } from '../db';
+import { writeFile, mkdir } from 'fs/promises';
+import { join } from 'path';
+import { existsSync } from 'fs';
 
 const router = Router();
+
+// Ensure uploads directory exists (only for local storage)
+const UPLOADS_DIR = join(__dirname, '..', '..', 'uploads');
+const ensureUploadsDir = async () => {
+  if (process.env.USE_BLOB_STORAGE !== 'true') {
+    if (!existsSync(UPLOADS_DIR)) {
+      await mkdir(UPLOADS_DIR, { recursive: true });
+    }
+  }
+};
+ensureUploadsDir();
+
+// Blob storage upload function for Vercel Blob Storage
+async function uploadToBlobStorage(fileName: string, buffer: Buffer, contentType?: string): Promise<string> {
+  try {
+    // Dynamic import to avoid loading if not using blob storage
+    const { put } = await import('@vercel/blob');
+    
+    const blob = await put(fileName, buffer, {
+      access: 'public',
+      contentType: contentType || 'application/octet-stream',
+      token: process.env.BLOB_READ_WRITE_TOKEN,
+    });
+    
+    return blob.url;
+  } catch (error) {
+    console.error('Vercel Blob upload error:', error);
+    throw new Error(`Failed to upload to Vercel Blob: ${error instanceof Error ? error.message : 'Unknown error'}`);
+  }
+}
 
 /**
  * GET /user/me - Get current user profile
@@ -27,7 +60,8 @@ router.get('/me', authenticateToken, async (req: Request, res: Response) => {
               credit_per_second,
               specialty,
               links,
-              ratings
+              ratings,
+              profile_picture
        FROM users
        WHERE id = $1`,
       [userId],
@@ -56,6 +90,15 @@ router.get('/me', authenticateToken, async (req: Request, res: Response) => {
     const following = followingResult.rows[0]?.count ?? 0;
 
     const user = rows[0];
+    
+    // Get full URL for profile picture
+    let profilePictureUrl = user.profile_picture ?? null;
+    if (profilePictureUrl && !profilePictureUrl.startsWith('http')) {
+      // If it's a local path, construct full URL
+      const baseUrl = process.env.API_BASE_URL || 'http://localhost:4000';
+      profilePictureUrl = `${baseUrl}${profilePictureUrl}`;
+    }
+    
     return res.json({
       id: user.id,
       email: user.email,
@@ -74,6 +117,7 @@ router.get('/me', authenticateToken, async (req: Request, res: Response) => {
       specialty: user.specialty ?? null,
       links: user.links ?? null,
       ratings: user.ratings ?? null,
+      profilePicture: profilePictureUrl,
       followers,
       following,
     });
@@ -390,6 +434,7 @@ router.get('/search', authenticateToken, async (req: Request, res: Response) => 
         country,
         bio,
         last_seen_at,
+        profile_picture,
         COALESCE(chat_rate_charging_enabled, FALSE) as chat_rate_charging_enabled
       FROM users
       WHERE is_active = TRUE
@@ -453,6 +498,13 @@ router.get('/search', authenticateToken, async (req: Request, res: Response) => 
           }
         }
 
+        // Get full URL for profile picture
+        let profilePictureUrl = u.profile_picture ?? null;
+        if (profilePictureUrl && !profilePictureUrl.startsWith('http')) {
+          const baseUrl = process.env.API_BASE_URL || 'http://localhost:4000';
+          profilePictureUrl = `${baseUrl}${profilePictureUrl}`;
+        }
+
         return {
           id: u.id,
           displayName: u.display_name,
@@ -462,6 +514,7 @@ router.get('/search', authenticateToken, async (req: Request, res: Response) => 
           ratings: u.ratings,
           country: u.country,
           bio: u.bio,
+          profilePicture: profilePictureUrl,
           activityStatus,
           isFollowing: contactIds.has(u.id),
           followers: followersMap.get(u.id) ?? 0,
@@ -725,6 +778,112 @@ router.put('/me/chat-rate', authenticateToken, async (req: Request, res: Respons
     });
   } catch (err) {
     console.error('Update chat rate config error', err);
+    return res.status(500).json({ message: 'Internal server error' });
+  }
+});
+
+/**
+ * POST /user/me/profile-picture
+ * Upload profile picture (display picture)
+ */
+router.post('/me/profile-picture', authenticateToken, async (req: Request, res: Response) => {
+  try {
+    const userId = req.user!.id;
+    const { fileData, fileName, mimeType } = req.body;
+
+    if (!fileData || !fileName) {
+      return res.status(400).json({ message: 'File data and file name are required' });
+    }
+
+    // Validate file type (only images)
+    const validImageTypes = ['image/jpeg', 'image/jpg', 'image/png', 'image/gif', 'image/webp'];
+    const fileMimeType = mimeType || 'image/jpeg';
+    if (!validImageTypes.includes(fileMimeType)) {
+      return res.status(400).json({ message: 'Only image files are allowed for profile pictures' });
+    }
+
+    // Generate unique filename
+    const fileExt = fileName.split('.').pop() || 'jpg';
+    const uniqueFileName = `profile-${userId}-${Date.now()}-${Math.random().toString(36).substring(7)}.${fileExt}`;
+
+    // Handle base64 file data
+    let fileBuffer: Buffer;
+    if (fileData.startsWith('data:')) {
+      // Base64 with data URI prefix
+      const base64Data = fileData.split(',')[1];
+      fileBuffer = Buffer.from(base64Data, 'base64');
+    } else {
+      // Plain base64
+      fileBuffer = Buffer.from(fileData, 'base64');
+    }
+
+    // Validate file size (max 5MB)
+    const fileSize = fileBuffer.length;
+    const maxSize = 5 * 1024 * 1024; // 5MB
+    if (fileSize > maxSize) {
+      return res.status(400).json({ message: 'Profile picture must be smaller than 5MB' });
+    }
+
+    // Upload to Vercel Blob Storage if configured, otherwise save locally
+    let fileUrl: string;
+    const useBlobStorage = process.env.USE_BLOB_STORAGE === 'true';
+    const blobReadWriteToken = process.env.BLOB_READ_WRITE_TOKEN;
+
+    console.log('Profile picture upload configuration:', {
+      useBlobStorage,
+      hasToken: !!blobReadWriteToken,
+      fileName: uniqueFileName,
+    });
+
+    if (useBlobStorage && blobReadWriteToken) {
+      // Upload to Vercel Blob Storage
+      try {
+        const blobUrl = await uploadToBlobStorage(uniqueFileName, fileBuffer, fileMimeType);
+        fileUrl = blobUrl;
+        console.log('Profile picture uploaded to Vercel Blob Storage:', fileUrl);
+      } catch (blobError) {
+        console.error('Vercel Blob storage upload failed, falling back to local:', blobError);
+        // Fallback to local storage
+        const filePath = join(UPLOADS_DIR, uniqueFileName);
+        await writeFile(filePath, fileBuffer);
+        fileUrl = `/uploads/${uniqueFileName}`;
+        console.log('Profile picture saved locally as fallback:', filePath);
+      }
+    } else {
+      // Save to local filesystem
+      const filePath = join(UPLOADS_DIR, uniqueFileName);
+      await writeFile(filePath, fileBuffer);
+      fileUrl = `/uploads/${uniqueFileName}`;
+      console.log('Profile picture saved locally:', filePath, 'URL:', fileUrl);
+    }
+
+    // Update user's profile_picture in database
+    const { rows } = await pool.query(
+      `UPDATE users 
+       SET profile_picture = $1 
+       WHERE id = $2 
+       RETURNING id, profile_picture`,
+      [fileUrl, userId]
+    );
+
+    if (rows.length === 0) {
+      return res.status(404).json({ message: 'User not found' });
+    }
+
+    // Return the full URL
+    let profilePictureUrl = fileUrl;
+    if (!fileUrl.startsWith('http')) {
+      const baseUrl = process.env.API_BASE_URL || 'http://localhost:4000';
+      profilePictureUrl = `${baseUrl}${fileUrl}`;
+    }
+
+    return res.json({
+      success: true,
+      profilePicture: profilePictureUrl,
+      message: 'Profile picture updated successfully',
+    });
+  } catch (err) {
+    console.error('Profile picture upload error', err);
     return res.status(500).json({ message: 'Internal server error' });
   }
 });
