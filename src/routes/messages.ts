@@ -299,11 +299,20 @@ router.get('/conversation/:userId', authenticateToken, async (req: Request, res:
 router.post('/', authenticateToken, async (req: Request, res: Response) => {
   try {
     const senderId = req.user!.id;
-    const { recipientId, content, replyToMessageId, idempotencyKey } = req.body;
+    const { recipientId, content, replyToMessageId, idempotencyKey, links } = req.body;
 
     if (!recipientId || !content || !content.trim()) {
       return res.status(400).json({ message: 'Recipient ID and content are required' });
     }
+
+    // Extract URLs from content if not provided
+    const urlRegex = /(https?:\/\/[^\s]+|www\.[^\s]+|[a-zA-Z0-9-]+\.[a-zA-Z]{2,}[^\s]*)/gi;
+    const detectedUrls = links || content.match(urlRegex)?.map((url: string) => {
+      if (!url.startsWith('http://') && !url.startsWith('https://')) {
+        return `https://${url}`;
+      }
+      return url;
+    }) || [];
 
     // Ensure blocked_users table exists (migration safety)
     await pool.query(`
@@ -340,6 +349,22 @@ router.post('/', authenticateToken, async (req: Request, res: Response) => {
       replyToMessageId: replyToMessageId || null,
       idempotencyKey: idempotencyKey || null,
     });
+
+    // Create link attachments if URLs detected
+    if (detectedUrls.length > 0) {
+      for (const url of detectedUrls) {
+        try {
+          await pool.query(
+            `INSERT INTO message_attachments (message_id, type, file_name, file_url, file_size, mime_type)
+             VALUES ($1, $2, $3, $4, $5, $6)`,
+            [message.id, 'link', url, url, 0, 'text/plain']
+          );
+        } catch (err) {
+          console.error('Failed to create link attachment:', err);
+          // Continue even if attachment creation fails
+        }
+      }
+    }
 
     // Format message for response
     const messageData = {
