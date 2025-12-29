@@ -1824,5 +1824,90 @@ router.post('/batch-delete', authenticateToken, async (req: Request, res: Respon
   }
 });
 
+/**
+ * GET /messages/pin/:userId
+ * Check if conversation is pinned
+ */
+router.get('/pin/:userId', authenticateToken, async (req: Request, res: Response) => {
+  try {
+    const currentUserId = req.user!.id;
+    const otherUserId = req.params.userId;
+
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS pinned_chats (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        chat_user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        pinned_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        UNIQUE (user_id, chat_user_id)
+      )
+    `).catch(() => {});
+
+    const { rows } = await pool.query(
+      `SELECT 1 FROM pinned_chats WHERE user_id = $1 AND chat_user_id = $2`,
+      [currentUserId, otherUserId]
+    );
+
+    return res.json({ pinned: rows.length > 0 });
+  } catch (err) {
+    console.error('Check pin status error', err);
+    return res.json({ pinned: false });
+  }
+});
+
+/**
+ * POST /messages/pin/:userId
+ * Pin a conversation
+ */
+router.post('/pin/:userId', authenticateToken, async (req: Request, res: Response) => {
+  try {
+    const currentUserId = req.user!.id;
+    const otherUserId = req.params.userId;
+
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS pinned_chats (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        chat_user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        pinned_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        UNIQUE (user_id, chat_user_id)
+      )
+    `).catch(() => {});
+
+    await pool.query(
+      `INSERT INTO pinned_chats (user_id, chat_user_id)
+       VALUES ($1, $2)
+       ON CONFLICT (user_id, chat_user_id) DO NOTHING`,
+      [currentUserId, otherUserId]
+    );
+
+    return res.json({ success: true });
+  } catch (err) {
+    console.error('Pin chat error', err);
+    return res.status(500).json({ message: 'Internal server error' });
+  }
+});
+
+/**
+ * DELETE /messages/pin/:userId
+ * Unpin a conversation
+ */
+router.delete('/pin/:userId', authenticateToken, async (req: Request, res: Response) => {
+  try {
+    const currentUserId = req.user!.id;
+    const otherUserId = req.params.userId;
+
+    await pool.query(
+      `DELETE FROM pinned_chats WHERE user_id = $1 AND chat_user_id = $2`,
+      [currentUserId, otherUserId]
+    );
+
+    return res.json({ success: true });
+  } catch (err) {
+    console.error('Unpin chat error', err);
+    return res.status(500).json({ message: 'Internal server error' });
+  }
+});
+
 export default router;
 
