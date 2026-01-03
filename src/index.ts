@@ -7,6 +7,7 @@ import { Server } from 'socket.io';
 import authRouter from './auth';
 import userRouter from './routes/user';
 import messagesRouter from './routes/messages';
+import callsRouter from './routes/calls';
 import { setupSocketIO } from './socket';
 
 dotenv.config();
@@ -55,6 +56,7 @@ app.use('/auth', authRouter);
 // Protected routes (require authentication)
 app.use('/user', userRouter);
 app.use('/messages', messagesRouter);
+app.use('/calls', callsRouter);
 
 // Setup Socket.IO
 setupSocketIO(io);
