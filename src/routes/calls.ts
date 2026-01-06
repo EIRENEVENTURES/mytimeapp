@@ -49,31 +49,36 @@ function generateAgoraToken(
     throw new Error('Agora credentials not configured');
   }
 
-  // Simple token generation (for production, use Agora's official SDK)
-  // This is a simplified version - in production, use: npm install agora-access-token
-  const timestamp = Math.floor(Date.now() / 1000) + expirationTime;
-  const token = Buffer.from(
-    JSON.stringify({
-      app_id: AGORA_APP_ID,
-      channel: channelName,
-      uid,
-      role,
-      expire: timestamp,
-    })
-  ).toString('base64');
-
-  // In production, use proper Agora token generation:
-  // const { RtcTokenBuilder, RtcRole } = require('agora-access-token');
-  // return RtcTokenBuilder.buildTokenWithUid(
-  //   AGORA_APP_ID,
-  //   AGORA_APP_CERTIFICATE,
-  //   channelName,
-  //   parseInt(uid),
-  //   role === 'publisher' ? RtcRole.PUBLISHER : RtcRole.SUBSCRIBER,
-  //   timestamp
-  // );
-
-  return token;
+  // Try to use proper Agora token generation if available
+  try {
+    const { RtcTokenBuilder, RtcRole } = require('agora-access-token');
+    const timestamp = Math.floor(Date.now() / 1000) + expirationTime;
+    
+    return RtcTokenBuilder.buildTokenWithUid(
+      AGORA_APP_ID,
+      AGORA_APP_CERTIFICATE,
+      channelName,
+      parseInt(uid) || 0,
+      role === 'publisher' ? RtcRole.PUBLISHER : RtcRole.SUBSCRIBER,
+      timestamp
+    );
+  } catch (error) {
+    // Fallback to simplified token if agora-access-token is not installed
+    console.warn('[Calls] agora-access-token not installed, using simplified token. Install it for production: npm install agora-access-token');
+    
+    const timestamp = Math.floor(Date.now() / 1000) + expirationTime;
+    const token = Buffer.from(
+      JSON.stringify({
+        app_id: AGORA_APP_ID,
+        channel: channelName,
+        uid,
+        role,
+        expire: timestamp,
+      })
+    ).toString('base64');
+    
+    return token;
+  }
 }
 
 /**
@@ -579,6 +584,26 @@ router.get('/:callId', authenticateToken, async (req: Request, res: Response) =>
     res.json({ call: result.rows[0] });
   } catch (error: any) {
     console.error('Get call error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+/**
+ * GET /calls/config/agora-app-id
+ * Get Agora App ID for client configuration
+ */
+router.get('/config/agora-app-id', authenticateToken, async (req: Request, res: Response) => {
+  try {
+    if (!AGORA_APP_ID) {
+      return res.status(503).json({ 
+        error: 'Agora service not configured',
+        appId: '' 
+      });
+    }
+
+    res.json({ appId: AGORA_APP_ID });
+  } catch (error: any) {
+    console.error('Get Agora config error:', error);
     res.status(500).json({ error: 'Internal server error' });
   }
 });
