@@ -45,18 +45,33 @@ export async function authenticateToken(
   try {
     const decoded = jwt.verify(token, process.env.JWT_ACCESS_SECRET) as JwtPayload;
 
-    // Verify user still exists and is active, and update last_seen_at for activity tracking
+    // First, verify user exists and is active (SELECT query)
     const { rows } = await pool.query(
-      'UPDATE users SET last_seen_at = NOW() WHERE id = $1 AND is_active = TRUE RETURNING id, email, role',
+      'SELECT id, email, role, is_active FROM users WHERE id = $1',
       [decoded.sub],
     );
 
     if (rows.length === 0) {
-      res.status(401).json({ message: 'User not found or inactive' });
+      res.status(401).json({ message: 'User not found' });
       return;
     }
 
     const user = rows[0];
+
+    // Check if user is active
+    if (!user.is_active) {
+      res.status(401).json({ message: 'User account is inactive' });
+      return;
+    }
+
+    // Update last_seen_at for activity tracking (non-blocking - don't fail auth if this fails)
+    pool.query(
+      'UPDATE users SET last_seen_at = NOW() WHERE id = $1',
+      [decoded.sub],
+    ).catch((err) => {
+      // Log error but don't fail authentication
+      console.error('Failed to update last_seen_at for user:', decoded.sub, err);
+    });
 
     req.user = {
       id: user.id,

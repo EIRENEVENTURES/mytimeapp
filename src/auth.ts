@@ -236,8 +236,12 @@ router.post('/otp/verify', async (req: Request, res: Response) => {
     const otpRecord = rows[0];
     const now = new Date();
     const expiresAt = new Date(otpRecord.expires_at);
+    
+    // Add 2 second buffer to account for network latency and clock synchronization
+    const bufferMs = 2000;
+    const expirationTimeWithBuffer = expiresAt.getTime() + bufferMs;
 
-    if (expiresAt.getTime() <= now.getTime()) {
+    if (expirationTimeWithBuffer <= now.getTime()) {
       return res.status(400).json({ message: 'OTP has expired' });
     }
 
@@ -296,8 +300,12 @@ router.post('/signup', async (req: Request, res: Response) => {
     const otpRecord = otpResult.rows[0];
     const now = new Date();
     const expiresAt = new Date(otpRecord.expires_at);
+    
+    // Add 2 second buffer to account for network latency and clock synchronization
+    const bufferMs = 2000;
+    const expirationTimeWithBuffer = expiresAt.getTime() + bufferMs;
 
-    if (expiresAt.getTime() <= now.getTime()) {
+    if (expirationTimeWithBuffer <= now.getTime()) {
       await client.query('ROLLBACK');
       return res.status(400).json({ message: 'OTP has expired' });
     }
@@ -802,8 +810,12 @@ router.post('/reset-password/confirm', authenticateToken, async (req: Request, r
     const otpRecord = otpRows[0];
     const now = new Date();
     const expiresAt = new Date(otpRecord.expires_at);
+    
+    // Add 2 second buffer to account for network latency and clock synchronization
+    const bufferMs = 2000;
+    const expirationTimeWithBuffer = expiresAt.getTime() + bufferMs;
 
-    if (expiresAt.getTime() <= now.getTime()) {
+    if (expirationTimeWithBuffer <= now.getTime()) {
       await client.query('ROLLBACK');
       return res.status(400).json({ message: 'OTP has expired' });
     }
@@ -1074,8 +1086,12 @@ router.post('/forgot-password/reset', async (req: Request, res: Response) => {
     const otpRecord = otpResult.rows[0];
     const now = new Date();
     const expiresAt = new Date(otpRecord.expires_at);
+    
+    // Add 2 second buffer to account for network latency and clock synchronization
+    const bufferMs = 2000;
+    const expirationTimeWithBuffer = expiresAt.getTime() + bufferMs;
 
-    if (expiresAt.getTime() <= now.getTime()) {
+    if (expirationTimeWithBuffer <= now.getTime()) {
       await client.query('ROLLBACK');
       return res.status(400).json({ message: 'OTP has expired' });
     }
