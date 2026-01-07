@@ -50,12 +50,16 @@ async function createMessage(params) {
         // Insert message
         const { rows } = await db_1.pool.query(`INSERT INTO messages (sender_id, recipient_id, content, status, reply_to_message_id, idempotency_key)
        VALUES ($1, $2, $3, $4, $5, $6)
-       RETURNING id, sender_id, recipient_id, content, status, created_at, reply_to_message_id, is_forwarded, is_edited, is_pinned`, [senderId, recipientId, content.trim(), initialStatus, replyToMessageId || null, idempotencyKey || null]);
+       RETURNING id, sender_id, recipient_id, content, status, created_at, reply_to_message_id, is_forwarded, is_edited`, [senderId, recipientId, content.trim(), initialStatus, replyToMessageId || null, idempotencyKey || null]);
         const message = rows[0];
-        // Update unread counter (async, non-blocking)
-        if (!recipientOnline) {
-            (0, redis_1.incrementUnreadCount)(recipientId, senderId).catch((err) => console.error('Failed to increment unread count:', err));
-        }
+        // Update unread counter for recipient (async, non-blocking)
+        // IMPORTANT: Increment unread count ONLY for the RECIPIENT, not the sender
+        // A message is unread until the recipient actually reads it, regardless of online status
+        // "delivered" just means it reached the device, but it's still unread until opened
+        // recipientId = the user who RECEIVED the message (should see the badge)
+        // senderId = the user who SENT the message (should NOT see the badge)
+        console.log(`Incrementing unread count: recipientId=${recipientId}, senderId=${senderId}`);
+        (0, redis_1.incrementUnreadCount)(recipientId, senderId).catch((err) => console.error('Failed to increment unread count:', err));
         return {
             id: message.id,
             senderId: message.sender_id,
@@ -66,7 +70,7 @@ async function createMessage(params) {
             replyToMessageId: message.reply_to_message_id,
             isForwarded: message.is_forwarded || false,
             isEdited: message.is_edited || false,
-            isPinned: message.is_pinned || false,
+            isPinned: false, // New messages are never pinned initially (pinning is tracked in pinned_messages table)
         };
     }
     catch (err) {

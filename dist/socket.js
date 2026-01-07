@@ -37,6 +37,7 @@ var __importDefault = (this && this.__importDefault) || function (mod) {
 };
 Object.defineProperty(exports, "__esModule", { value: true });
 exports.setupSocketIO = setupSocketIO;
+exports.getIoInstance = getIoInstance;
 exports.emitMessageToUsers = emitMessageToUsers;
 exports.emitMessageStatus = emitMessageStatus;
 const jsonwebtoken_1 = __importDefault(require("jsonwebtoken"));
@@ -53,14 +54,16 @@ const conversationRooms = new Map();
  */
 function authenticateSocket(socket, token) {
     try {
-        const jwtSecret = process.env.JWT_SECRET;
+        // Use JWT_ACCESS_SECRET to match the secret used for signing access tokens
+        const jwtSecret = process.env.JWT_ACCESS_SECRET;
         if (!jwtSecret) {
-            console.error('JWT_SECRET not configured');
+            console.error('JWT_ACCESS_SECRET not configured');
             return null;
         }
+        // Token payload uses 'sub' for user ID (not 'id'), matching auth.ts structure
         const decoded = jsonwebtoken_1.default.verify(token, jwtSecret);
-        socket.userId = decoded.id;
-        return decoded.id;
+        socket.userId = decoded.sub;
+        return decoded.sub;
     }
     catch (error) {
         console.error('Socket authentication error:', error);
@@ -220,6 +223,12 @@ function setupSocketIO(io) {
             });
         });
     });
+}
+/**
+ * Get the Socket.IO instance (for use in routes)
+ */
+function getIoInstance() {
+    return ioInstance;
 }
 /**
  * Emit message to users (called from REST API routes)

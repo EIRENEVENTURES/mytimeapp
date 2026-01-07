@@ -764,4 +764,181 @@ router.post('/me/profile-picture', auth_1.authenticateToken, async (req, res) =>
         return res.status(500).json({ message: 'Internal server error' });
     }
 });
+/**
+ * POST /user/me/block/:userId
+ * Block a user
+ */
+router.post('/me/block/:userId', auth_1.authenticateToken, async (req, res) => {
+    try {
+        const currentUserId = req.user.id;
+        const blockedUserId = req.params.userId;
+        if (currentUserId === blockedUserId) {
+            return res.status(400).json({ message: 'Cannot block yourself' });
+        }
+        // Ensure blocked_users table exists
+        await db_1.pool.query(`
+      CREATE TABLE IF NOT EXISTS blocked_users (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        blocker_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        blocked_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        reason TEXT,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        UNIQUE (blocker_id, blocked_id)
+      )
+    `).catch(() => {
+            // Table might already exist
+        });
+        // Check if user exists
+        const { rows: userRows } = await db_1.pool.query(`SELECT id FROM users WHERE id = $1 AND is_active = TRUE`, [blockedUserId]);
+        if (userRows.length === 0) {
+            return res.status(404).json({ message: 'User not found' });
+        }
+        // Block user (insert or update)
+        const { reason } = req.body;
+        await db_1.pool.query(`INSERT INTO blocked_users (blocker_id, blocked_id, reason)
+       VALUES ($1, $2, $3)
+       ON CONFLICT (blocker_id, blocked_id) 
+       DO UPDATE SET reason = EXCLUDED.reason, created_at = NOW()`, [currentUserId, blockedUserId, reason || null]);
+        return res.json({
+            success: true,
+            message: 'User blocked successfully',
+            blocked: true
+        });
+    }
+    catch (err) {
+        console.error('Block user error', err);
+        return res.status(500).json({ message: 'Internal server error' });
+    }
+});
+/**
+ * DELETE /user/me/block/:userId
+ * Unblock a user
+ */
+router.delete('/me/block/:userId', auth_1.authenticateToken, async (req, res) => {
+    try {
+        const currentUserId = req.user.id;
+        const blockedUserId = req.params.userId;
+        await db_1.pool.query(`DELETE FROM blocked_users 
+       WHERE blocker_id = $1 AND blocked_id = $2`, [currentUserId, blockedUserId]);
+        return res.json({
+            success: true,
+            message: 'User unblocked successfully',
+            blocked: false
+        });
+    }
+    catch (err) {
+        console.error('Unblock user error', err);
+        return res.status(500).json({ message: 'Internal server error' });
+    }
+});
+/**
+ * GET /user/me/blocked
+ * Get list of blocked users
+ */
+router.get('/me/blocked', auth_1.authenticateToken, async (req, res) => {
+    try {
+        const currentUserId = req.user.id;
+        const { rows } = await db_1.pool.query(`SELECT 
+        bu.blocked_id as id,
+        u.display_name,
+        u.username,
+        u.profile_picture,
+        bu.reason,
+        bu.created_at as blocked_at
+       FROM blocked_users bu
+       JOIN users u ON bu.blocked_id = u.id
+       WHERE bu.blocker_id = $1
+       ORDER BY bu.created_at DESC`, [currentUserId]);
+        // Format profile picture URLs
+        const baseUrl = process.env.API_BASE_URL || 'http://localhost:4000';
+        const blockedUsers = rows.map((row) => ({
+            id: row.id,
+            displayName: row.display_name,
+            username: row.username,
+            profilePicture: row.profile_picture && !row.profile_picture.startsWith('http')
+                ? `${baseUrl}${row.profile_picture}`
+                : row.profile_picture,
+            reason: row.reason,
+            blockedAt: row.blocked_at,
+        }));
+        return res.json({ blockedUsers });
+    }
+    catch (err) {
+        console.error('Get blocked users error', err);
+        return res.status(500).json({ message: 'Internal server error' });
+    }
+});
+/**
+ * POST /user/me/report/:userId
+ * Report a user
+ */
+router.post('/me/report/:userId', auth_1.authenticateToken, async (req, res) => {
+    try {
+        const currentUserId = req.user.id;
+        const reportedUserId = req.params.userId;
+        if (currentUserId === reportedUserId) {
+            return res.status(400).json({ message: 'Cannot report yourself' });
+        }
+        // Ensure user_reports table exists
+        await db_1.pool.query(`
+      CREATE TABLE IF NOT EXISTS user_reports (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        reporter_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        reported_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        reasons TEXT[] NOT NULL,
+        additional_info TEXT,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        status VARCHAR(50) DEFAULT 'pending',
+        UNIQUE (reporter_id, reported_id)
+      )
+    `).catch(() => {
+            // Table might already exist
+        });
+        // Check if user exists
+        const { rows: userRows } = await db_1.pool.query(`SELECT id FROM users WHERE id = $1 AND is_active = TRUE`, [reportedUserId]);
+        if (userRows.length === 0) {
+            return res.status(404).json({ message: 'User not found' });
+        }
+        const { reasons, additionalInfo, blockAfterReport } = req.body;
+        if (!reasons || !Array.isArray(reasons) || reasons.length === 0) {
+            return res.status(400).json({ message: 'At least one reason is required' });
+        }
+        // Insert or update report
+        await db_1.pool.query(`INSERT INTO user_reports (reporter_id, reported_id, reasons, additional_info)
+       VALUES ($1, $2, $3, $4)
+       ON CONFLICT (reporter_id, reported_id) 
+       DO UPDATE SET 
+         reasons = EXCLUDED.reasons,
+         additional_info = EXCLUDED.additional_info,
+         created_at = NOW(),
+         status = 'pending'`, [currentUserId, reportedUserId, reasons, additionalInfo || null]);
+        // Block user if requested
+        if (blockAfterReport) {
+            await db_1.pool.query(`
+        CREATE TABLE IF NOT EXISTS blocked_users (
+          id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+          blocker_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+          blocked_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+          reason TEXT,
+          created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+          UNIQUE (blocker_id, blocked_id)
+        )
+      `).catch(() => {
+                // Table might already exist
+            });
+            await db_1.pool.query(`INSERT INTO blocked_users (blocker_id, blocked_id, reason)
+         VALUES ($1, $2, $3)
+         ON CONFLICT (blocker_id, blocked_id) DO NOTHING`, [currentUserId, reportedUserId, 'Blocked after report']);
+        }
+        return res.json({
+            success: true,
+            message: 'Report submitted successfully',
+            blocked: blockAfterReport || false
+        });
+    }
+    catch (err) {
+        console.error('Report user error', err);
+        return res.status(500).json({ message: 'Internal server error' });
+    }
+});
 exports.default = router;

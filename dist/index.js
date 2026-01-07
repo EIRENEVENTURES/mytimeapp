@@ -45,6 +45,7 @@ const socket_io_1 = require("socket.io");
 const auth_1 = __importDefault(require("./auth"));
 const user_1 = __importDefault(require("./routes/user"));
 const messages_1 = __importDefault(require("./routes/messages"));
+const calls_1 = __importDefault(require("./routes/calls"));
 const socket_1 = require("./socket");
 dotenv_1.default.config();
 const app = (0, express_1.default)();
@@ -87,6 +88,7 @@ app.use('/auth', auth_1.default);
 // Protected routes (require authentication)
 app.use('/user', user_1.default);
 app.use('/messages', messages_1.default);
+app.use('/calls', calls_1.default);
 // Setup Socket.IO
 (0, socket_1.setupSocketIO)(io);
 // Initialize Redis connection

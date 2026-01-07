@@ -206,7 +206,10 @@ router.post('/otp/verify', async (req, res) => {
         const otpRecord = rows[0];
         const now = new Date();
         const expiresAt = new Date(otpRecord.expires_at);
-        if (expiresAt.getTime() <= now.getTime()) {
+        // Add 2 second buffer to account for network latency and clock synchronization
+        const bufferMs = 2000;
+        const expirationTimeWithBuffer = expiresAt.getTime() + bufferMs;
+        if (expirationTimeWithBuffer <= now.getTime()) {
             return res.status(400).json({ message: 'OTP has expired' });
         }
         if (otpRecord.verified) {
@@ -253,7 +256,10 @@ router.post('/signup', async (req, res) => {
         const otpRecord = otpResult.rows[0];
         const now = new Date();
         const expiresAt = new Date(otpRecord.expires_at);
-        if (expiresAt.getTime() <= now.getTime()) {
+        // Add 2 second buffer to account for network latency and clock synchronization
+        const bufferMs = 2000;
+        const expirationTimeWithBuffer = expiresAt.getTime() + bufferMs;
+        if (expirationTimeWithBuffer <= now.getTime()) {
             await client.query('ROLLBACK');
             return res.status(400).json({ message: 'OTP has expired' });
         }
@@ -667,7 +673,10 @@ router.post('/reset-password/confirm', auth_1.authenticateToken, async (req, res
         const otpRecord = otpRows[0];
         const now = new Date();
         const expiresAt = new Date(otpRecord.expires_at);
-        if (expiresAt.getTime() <= now.getTime()) {
+        // Add 2 second buffer to account for network latency and clock synchronization
+        const bufferMs = 2000;
+        const expirationTimeWithBuffer = expiresAt.getTime() + bufferMs;
+        if (expirationTimeWithBuffer <= now.getTime()) {
             await client.query('ROLLBACK');
             return res.status(400).json({ message: 'OTP has expired' });
         }
@@ -721,8 +730,16 @@ router.post('/forgot-password/send-otp', async (req, res) => {
         return res.status(400).json({ message: 'Email is required' });
     }
     if (!resend) {
-        return res.status(500).json({ message: 'Email service is not configured' });
+        console.error('[Forgot Password] Resend service is not configured. RESEND_API_KEY is missing.');
+        return res.status(500).json({
+            message: 'Email service is not configured. Please contact support.'
+        });
     }
+    // Log configuration status (without exposing sensitive data)
+    console.log('[Forgot Password] Resend service initialized:', {
+        hasApiKey: !!process.env.RESEND_API_KEY,
+        fromEmail: process.env.RESEND_FROM_EMAIL || 'My Time <onboarding@resend.dev>',
+    });
     const client = await db_1.pool.connect();
     try {
         // Check if user exists
@@ -769,7 +786,7 @@ router.post('/forgot-password/send-otp', async (req, res) => {
             <td style="padding: 40px;">
               <h2 style="margin: 0 0 16px; color: #1F2937; font-size: 24px; font-weight: 600;">Reset Your Password</h2>
               <p style="margin: 0 0 24px; color: #6B7280; font-size: 16px; line-height: 1.6;">
-                Hi ${user.display_name},<br><br>
+                Hi ${user.display_name || 'there'},<br><br>
                 We received a request to reset your password. Use the verification code below to proceed.
               </p>
               
@@ -801,17 +818,64 @@ router.post('/forgot-password/send-otp', async (req, res) => {
 </body>
 </html>
     `;
-        await resend.emails.send({
-            from: process.env.RESEND_FROM_EMAIL || 'My Time <onboarding@resend.dev>',
-            to: email.toLowerCase().trim(),
-            subject: 'Reset Your Password - My Time',
-            html: emailHtml,
-        });
-        return res.json({ success: true, message: 'If the email exists, an OTP has been sent' });
+        try {
+            const fromEmail = process.env.RESEND_FROM_EMAIL || 'My Time <onboarding@resend.dev>';
+            const toEmail = email.toLowerCase().trim();
+            console.log(`[Forgot Password] Attempting to send OTP email to: ${toEmail}`);
+            console.log(`[Forgot Password] From email: ${fromEmail}`);
+            console.log(`[Forgot Password] OTP Code: ${otpCode}`);
+            const emailResult = await resend.emails.send({
+                from: fromEmail,
+                to: toEmail,
+                subject: 'Reset Your Password - My Time',
+                html: emailHtml,
+            });
+            console.log(`[Forgot Password] Email send result:`, emailResult);
+            if (!emailResult || !emailResult.id) {
+                console.error('[Forgot Password] Email send failed - no ID returned:', emailResult);
+                // Rollback OTP insertion if email failed
+                await client.query('DELETE FROM otp_verifications WHERE email = $1 AND otp_code = $2', [
+                    email.toLowerCase().trim(),
+                    otpCode,
+                ]);
+                return res.status(500).json({
+                    message: 'Failed to send email. Please check your email service configuration.'
+                });
+            }
+            console.log(`[Forgot Password] Email sent successfully with ID: ${emailResult.id}`);
+            return res.json({ success: true, message: 'If the email exists, an OTP has been sent' });
+        }
+        catch (emailError) {
+            console.error('[Forgot Password] Email send error details:', {
+                error: emailError,
+                message: emailError?.message,
+                stack: emailError?.stack,
+                response: emailError?.response,
+            });
+            // Rollback OTP insertion if email failed
+            try {
+                await client.query('DELETE FROM otp_verifications WHERE email = $1 AND otp_code = $2', [
+                    email.toLowerCase().trim(),
+                    otpCode,
+                ]);
+            }
+            catch (rollbackError) {
+                console.error('[Forgot Password] Failed to rollback OTP:', rollbackError);
+            }
+            return res.status(500).json({
+                message: emailError?.message || 'Failed to send OTP email. Please try again later.'
+            });
+        }
     }
     catch (err) {
-        console.error('Forgot password OTP send error', err);
-        return res.status(500).json({ message: 'Failed to send OTP' });
+        console.error('[Forgot Password] General error:', {
+            error: err,
+            message: err?.message,
+            stack: err?.stack,
+        });
+        return res.status(500).json({
+            message: err?.message || 'Failed to process password reset request'
+        });
     }
     finally {
         client.release();
@@ -844,7 +908,10 @@ router.post('/forgot-password/reset', async (req, res) => {
         const otpRecord = otpResult.rows[0];
         const now = new Date();
         const expiresAt = new Date(otpRecord.expires_at);
-        if (expiresAt.getTime() <= now.getTime()) {
+        // Add 2 second buffer to account for network latency and clock synchronization
+        const bufferMs = 2000;
+        const expirationTimeWithBuffer = expiresAt.getTime() + bufferMs;
+        if (expirationTimeWithBuffer <= now.getTime()) {
             await client.query('ROLLBACK');
             return res.status(400).json({ message: 'OTP has expired' });
         }

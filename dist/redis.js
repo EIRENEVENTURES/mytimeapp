@@ -124,7 +124,11 @@ async function incrementUnreadCount(recipientId, senderId) {
     const client = getRedisClient();
     if (!client)
         return;
+    // Key format: unread:RECIPIENT_ID:SENDER_ID
+    // This means: "How many unread messages did SENDER_ID send to RECIPIENT_ID"
+    // Only RECIPIENT_ID should see this count in their badge
     const key = `unread:${recipientId}:${senderId}`;
+    console.log(`[Redis] Incrementing unread count: key=${key} (recipient=${recipientId}, sender=${senderId})`);
     await client.incr(key);
     await client.expire(key, 86400 * 7); // Expire after 7 days
 }
@@ -147,20 +151,47 @@ async function getAllUnreadCounts(recipientId) {
     const client = getRedisClient();
     if (!client)
         return new Map();
-    const pattern = `unread:${recipientId}:*`;
-    const keys = await client.keys(pattern);
-    const counts = new Map();
-    if (keys.length === 0)
-        return counts;
-    const values = await client.mget(...keys);
-    keys.forEach((key, index) => {
-        const senderId = key.split(':')[2];
-        const count = values[index] ? parseInt(values[index], 10) : 0;
-        if (count > 0) {
-            counts.set(senderId, count);
+    try {
+        // Ensure client is connected (lazyConnect requires explicit connection)
+        if (client.status !== 'ready' && client.status !== 'connecting') {
+            try {
+                await client.connect();
+            }
+            catch (connectError) {
+                // If connection fails, return empty map (fallback to DB)
+                console.error(`[Redis] Failed to connect for getAllUnreadCounts:`, connectError);
+                return new Map();
+            }
         }
-    });
-    return counts;
+        // Pattern: unread:RECIPIENT_ID:*
+        // This finds all keys where recipientId is the recipient
+        // Returns Map<senderId, count> - how many unread messages each sender sent to this recipient
+        const pattern = `unread:${recipientId}:*`;
+        const keys = await client.keys(pattern);
+        const counts = new Map();
+        if (keys.length === 0) {
+            console.log(`[Redis] No unread counts found for recipient ${recipientId}`);
+            return counts;
+        }
+        const values = await client.mget(...keys);
+        keys.forEach((key, index) => {
+            // Key format: unread:RECIPIENT_ID:SENDER_ID
+            // Extract senderId (the person who sent the messages)
+            const senderId = key.split(':')[2];
+            const count = values[index] ? parseInt(values[index], 10) : 0;
+            if (count > 0) {
+                counts.set(senderId, count);
+                console.log(`[Redis] Found ${count} unread messages from ${senderId} to ${recipientId}`);
+            }
+        });
+        console.log(`[Redis] Total unread counts for recipient ${recipientId}:`, Array.from(counts.entries()));
+        return counts;
+    }
+    catch (error) {
+        console.error(`[Redis] Error getting unread counts for recipient ${recipientId}:`, error);
+        // Return empty map on error (fallback to DB)
+        return new Map();
+    }
 }
 /**
  * Message fan-out queue (for async delivery)

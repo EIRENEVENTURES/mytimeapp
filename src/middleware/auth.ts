@@ -33,11 +33,13 @@ export async function authenticateToken(
   const token = authHeader && authHeader.split(' ')[1]; // Bearer TOKEN
 
   if (!token) {
+    console.log('[Auth] No token provided for', req.method, req.path);
     res.status(401).json({ message: 'Access token required' });
     return;
   }
 
   if (!process.env.JWT_ACCESS_SECRET) {
+    console.error('[Auth] JWT_ACCESS_SECRET not configured');
     res.status(500).json({ message: 'Server configuration error' });
     return;
   }
@@ -52,6 +54,7 @@ export async function authenticateToken(
     );
 
     if (rows.length === 0) {
+      console.log('[Auth] User not found:', decoded.sub, 'for', req.method, req.path);
       res.status(401).json({ message: 'User not found' });
       return;
     }
@@ -60,6 +63,7 @@ export async function authenticateToken(
 
     // Check if user is active
     if (!user.is_active) {
+      console.log('[Auth] User is inactive:', decoded.sub, 'for', req.method, req.path);
       res.status(401).json({ message: 'User account is inactive' });
       return;
     }
@@ -70,7 +74,7 @@ export async function authenticateToken(
       [decoded.sub],
     ).catch((err) => {
       // Log error but don't fail authentication
-      console.error('Failed to update last_seen_at for user:', decoded.sub, err);
+      console.error('[Auth] Failed to update last_seen_at for user:', decoded.sub, err);
     });
 
     req.user = {
@@ -82,13 +86,16 @@ export async function authenticateToken(
     next();
   } catch (err) {
     if (err instanceof jwt.TokenExpiredError) {
+      console.log('[Auth] Token expired for', req.method, req.path);
       res.status(401).json({ message: 'Token expired' });
       return;
     }
     if (err instanceof jwt.JsonWebTokenError) {
+      console.log('[Auth] Invalid token for', req.method, req.path, ':', err.message);
       res.status(401).json({ message: 'Invalid token' });
       return;
     }
+    console.error('[Auth] Authentication error for', req.method, req.path, ':', err);
     res.status(500).json({ message: 'Authentication error' });
   }
 }

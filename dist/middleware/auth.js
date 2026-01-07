@@ -14,22 +14,36 @@ async function authenticateToken(req, res, next) {
     const authHeader = req.headers.authorization;
     const token = authHeader && authHeader.split(' ')[1]; // Bearer TOKEN
     if (!token) {
+        console.log('[Auth] No token provided for', req.method, req.path);
         res.status(401).json({ message: 'Access token required' });
         return;
     }
     if (!process.env.JWT_ACCESS_SECRET) {
+        console.error('[Auth] JWT_ACCESS_SECRET not configured');
         res.status(500).json({ message: 'Server configuration error' });
         return;
     }
     try {
         const decoded = jsonwebtoken_1.default.verify(token, process.env.JWT_ACCESS_SECRET);
-        // Verify user still exists and is active, and update last_seen_at for activity tracking
-        const { rows } = await db_1.pool.query('UPDATE users SET last_seen_at = NOW() WHERE id = $1 AND is_active = TRUE RETURNING id, email, role', [decoded.sub]);
+        // First, verify user exists and is active (SELECT query)
+        const { rows } = await db_1.pool.query('SELECT id, email, role, is_active FROM users WHERE id = $1', [decoded.sub]);
         if (rows.length === 0) {
-            res.status(401).json({ message: 'User not found or inactive' });
+            console.log('[Auth] User not found:', decoded.sub, 'for', req.method, req.path);
+            res.status(401).json({ message: 'User not found' });
             return;
         }
         const user = rows[0];
+        // Check if user is active
+        if (!user.is_active) {
+            console.log('[Auth] User is inactive:', decoded.sub, 'for', req.method, req.path);
+            res.status(401).json({ message: 'User account is inactive' });
+            return;
+        }
+        // Update last_seen_at for activity tracking (non-blocking - don't fail auth if this fails)
+        db_1.pool.query('UPDATE users SET last_seen_at = NOW() WHERE id = $1', [decoded.sub]).catch((err) => {
+            // Log error but don't fail authentication
+            console.error('[Auth] Failed to update last_seen_at for user:', decoded.sub, err);
+        });
         req.user = {
             id: user.id,
             email: user.email,
@@ -39,13 +53,16 @@ async function authenticateToken(req, res, next) {
     }
     catch (err) {
         if (err instanceof jsonwebtoken_1.default.TokenExpiredError) {
+            console.log('[Auth] Token expired for', req.method, req.path);
             res.status(401).json({ message: 'Token expired' });
             return;
         }
         if (err instanceof jsonwebtoken_1.default.JsonWebTokenError) {
+            console.log('[Auth] Invalid token for', req.method, req.path, ':', err.message);
             res.status(401).json({ message: 'Invalid token' });
             return;
         }
+        console.error('[Auth] Authentication error for', req.method, req.path, ':', err);
         res.status(500).json({ message: 'Authentication error' });
     }
 }

@@ -50,6 +50,18 @@ router.get('/conversation/:userId', auth_1.authenticateToken, async (req, res) =
     try {
         const currentUserId = req.user.id;
         const otherUserId = req.params.userId;
+        // Ensure deleted_messages table exists (migration safety)
+        await db_1.pool.query(`
+      CREATE TABLE IF NOT EXISTS deleted_messages (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        message_id UUID NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
+        user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        deleted_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        UNIQUE (message_id, user_id)
+      )
+    `).catch(() => {
+            // Table might already exist, ignore error
+        });
         // Parse pagination parameters (cursor-based)
         const limit = Math.min(parseInt(req.query.limit) || 50, 50); // Default 50, max 50
         const before = req.query.before; // Message ID or timestamp to load messages before
@@ -68,9 +80,15 @@ router.get('/conversation/:userId', auth_1.authenticateToken, async (req, res) =
         RETURNING id, status
       )
       SELECT id FROM updated WHERE status = 'read'`, [currentUserId, otherUserId]);
+        // Reset unread count for this conversation when messages are marked as read
+        if (readResult.rows.length > 0) {
+            const { resetUnreadCount } = await Promise.resolve().then(() => __importStar(require('../redis')));
+            resetUnreadCount(currentUserId, otherUserId).catch((err) => console.error('Failed to reset unread count:', err));
+        }
         // Build cursor-based query - load latest messages first, then reverse for chronological order
         // Optimized: Use UNION to leverage separate indexes instead of OR
         // This allows index-only scans on both branches
+        // Exclude messages deleted by current user (soft delete)
         let query = `
       (
         SELECT 
@@ -85,7 +103,9 @@ router.get('/conversation/:userId', auth_1.authenticateToken, async (req, res) =
           COALESCE(m.is_forwarded, FALSE) as is_forwarded,
           COALESCE(m.is_edited, FALSE) as is_edited
         FROM messages m
+        LEFT JOIN deleted_messages dm ON m.id = dm.message_id AND dm.user_id = $1
         WHERE m.sender_id = $1 AND m.recipient_id = $2
+          AND dm.id IS NULL
     `;
         const params = [currentUserId, otherUserId];
         let paramIndex = 3;
@@ -124,7 +144,9 @@ router.get('/conversation/:userId', auth_1.authenticateToken, async (req, res) =
           COALESCE(m.is_forwarded, FALSE) as is_forwarded,
           COALESCE(m.is_edited, FALSE) as is_edited
         FROM messages m
-        WHERE m.sender_id = $2 AND m.recipient_id = $1`;
+        LEFT JOIN deleted_messages dm ON m.id = dm.message_id AND dm.user_id = $1
+        WHERE m.sender_id = $2 AND m.recipient_id = $1
+          AND dm.id IS NULL`;
         // Add same cursor condition for second branch
         if (before && before.match(/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i)) {
             if (params.length >= paramIndex) {
@@ -262,9 +284,37 @@ router.get('/conversation/:userId', auth_1.authenticateToken, async (req, res) =
 router.post('/', auth_1.authenticateToken, async (req, res) => {
     try {
         const senderId = req.user.id;
-        const { recipientId, content, replyToMessageId, idempotencyKey } = req.body;
+        const { recipientId, content, replyToMessageId, idempotencyKey, links } = req.body;
         if (!recipientId || !content || !content.trim()) {
             return res.status(400).json({ message: 'Recipient ID and content are required' });
+        }
+        // Extract URLs from content if not provided
+        const urlRegex = /(https?:\/\/[^\s]+|www\.[^\s]+|[a-zA-Z0-9-]+\.[a-zA-Z]{2,}[^\s]*)/gi;
+        const detectedUrls = links || content.match(urlRegex)?.map((url) => {
+            if (!url.startsWith('http://') && !url.startsWith('https://')) {
+                return `https://${url}`;
+            }
+            return url;
+        }) || [];
+        // Ensure blocked_users table exists (migration safety)
+        await db_1.pool.query(`
+      CREATE TABLE IF NOT EXISTS blocked_users (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        blocker_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        blocked_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        reason TEXT,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        UNIQUE (blocker_id, blocked_id)
+      )
+    `).catch(() => {
+            // Table might already exist, ignore error
+        });
+        // Check if user is blocked
+        const blockedCheck = await db_1.pool.query(`SELECT 1 FROM blocked_users 
+       WHERE (blocker_id = $1 AND blocked_id = $2) 
+          OR (blocker_id = $2 AND blocked_id = $1)`, [senderId, recipientId]);
+        if (blockedCheck.rows.length > 0) {
+            return res.status(403).json({ message: 'Cannot send message to this user' });
         }
         // Use message service for business logic
         const { createMessage } = await Promise.resolve().then(() => __importStar(require('../services/messageService')));
@@ -275,6 +325,19 @@ router.post('/', auth_1.authenticateToken, async (req, res) => {
             replyToMessageId: replyToMessageId || null,
             idempotencyKey: idempotencyKey || null,
         });
+        // Create link attachments if URLs detected
+        if (detectedUrls.length > 0) {
+            for (const url of detectedUrls) {
+                try {
+                    await db_1.pool.query(`INSERT INTO message_attachments (message_id, type, file_name, file_url, file_size, mime_type)
+             VALUES ($1, $2, $3, $4, $5, $6)`, [message.id, 'link', url, url, 0, 'text/plain']);
+                }
+                catch (err) {
+                    console.error('Failed to create link attachment:', err);
+                    // Continue even if attachment creation fails
+                }
+            }
+        }
         // Format message for response
         const messageData = {
             id: message.id,
@@ -350,6 +413,7 @@ router.get('/user/:userId', auth_1.authenticateToken, async (req, res) => {
         id,
         display_name,
         username,
+        profile_picture,
         COALESCE(chat_rate_per_second, credit_per_second, 0)::numeric as credit_per_second,
         COALESCE(chat_rate_charging_enabled, FALSE) as chat_rate_charging_enabled,
         last_seen_at
@@ -376,10 +440,19 @@ router.get('/user/:userId', auth_1.authenticateToken, async (req, res) => {
                 activityStatus = 'offline';
             }
         }
+        // Get base URL for constructing full profile picture URLs
+        const baseUrl = process.env.API_BASE_URL || 'http://localhost:4000';
+        // Get full URL for profile picture
+        let userAvatar = user.profile_picture ?? null;
+        if (userAvatar && !userAvatar.startsWith('http')) {
+            // If it's a local path, construct full URL
+            userAvatar = `${baseUrl}${userAvatar}`;
+        }
         return res.json({
             id: user.id,
             displayName: user.display_name,
             username: user.username,
+            userAvatar,
             creditPerSecond: Number(user.credit_per_second) ?? 0,
             rateChargingEnabled: user.chat_rate_charging_enabled ?? false,
             activityStatus,
@@ -561,24 +634,32 @@ router.get('/upload/progress/:uploadId', auth_1.authenticateToken, async (req, r
 });
 /**
  * GET /messages/unread-count
- * Get total count of unread messages for the current user
+ * Get count of unique users with unread messages (for HomeScreen badge)
+ * This is different from the total unread message count - it counts conversations, not messages
  */
 router.get('/unread-count', auth_1.authenticateToken, async (req, res) => {
     try {
         const currentUserId = req.user.id;
         const { getAllUnreadCounts } = await Promise.resolve().then(() => __importStar(require('../redis')));
         // Try Redis first (fast)
+        // getAllUnreadCounts returns Map<senderId, count> for messages received by currentUserId
+        // Count unique users (senders) who have unread messages TO currentUserId
         const redisCounts = await getAllUnreadCounts(currentUserId);
+        console.log(`[UnreadCount API] User ${currentUserId} has unread messages from ${redisCounts.size} unique senders:`, Array.from(redisCounts.keys()));
         if (redisCounts.size > 0) {
-            const total = Array.from(redisCounts.values()).reduce((sum, count) => sum + count, 0);
-            return res.json({ unreadCount: total });
+            // Count unique users (keys in the map), not total messages
+            const uniqueUsersCount = redisCounts.size;
+            return res.json({ unreadCount: uniqueUsersCount });
         }
         // Fallback to DB if Redis unavailable
-        const { rows } = await db_1.pool.query(`SELECT COUNT(*) as unread_count
+        // Count DISTINCT sender_id to get number of unique users with unread messages
+        // IMPORTANT: Only count messages where currentUserId is the RECIPIENT
+        const { rows } = await db_1.pool.query(`SELECT COUNT(DISTINCT sender_id) as unread_users_count
        FROM messages
        WHERE recipient_id = $1
          AND status != 'read'`, [currentUserId]);
-        const unreadCount = parseInt(rows[0].unread_count, 10) || 0;
+        const unreadCount = parseInt(rows[0].unread_users_count, 10) || 0;
+        console.log(`[UnreadCount API] User ${currentUserId} has ${unreadCount} unique senders with unread messages (from DB)`);
         return res.json({ unreadCount });
     }
     catch (err) {
@@ -690,15 +771,34 @@ router.put('/batch-status', auth_1.authenticateToken, async (req, res) => {
 router.get('/chats', auth_1.authenticateToken, async (req, res) => {
     try {
         const currentUserId = req.user.id;
+        // Ensure blocked_users table exists (migration safety)
+        await db_1.pool.query(`
+      CREATE TABLE IF NOT EXISTS blocked_users (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        blocker_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        blocked_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        reason TEXT,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        UNIQUE (blocker_id, blocked_id)
+      )
+    `).catch(() => {
+            // Table might already exist, ignore error
+        });
         // Optimized: Split into multiple cheap queries to avoid GROUP BY and complex CTEs
         // Query 1: Get distinct conversation partners (index scan)
+        // Exclude blocked users
         const partnersResult = await db_1.pool.query(`SELECT DISTINCT
         CASE 
-          WHEN sender_id = $1 THEN recipient_id
-          ELSE sender_id
+          WHEN m.sender_id = $1 THEN m.recipient_id
+          ELSE m.sender_id
         END as partner_id
-      FROM messages
-      WHERE sender_id = $1 OR recipient_id = $1`, [currentUserId]);
+      FROM messages m
+      LEFT JOIN blocked_users bu ON (
+        (bu.blocker_id = $1 AND bu.blocked_id = CASE WHEN m.sender_id = $1 THEN m.recipient_id ELSE m.sender_id END)
+        OR (bu.blocked_id = $1 AND bu.blocker_id = CASE WHEN m.sender_id = $1 THEN m.recipient_id ELSE m.sender_id END)
+      )
+      WHERE (m.sender_id = $1 OR m.recipient_id = $1)
+        AND bu.id IS NULL`, [currentUserId]);
         const partnerIds = partnersResult.rows.map((r) => r.partner_id);
         if (partnerIds.length === 0) {
             return res.json({ chats: [] });
@@ -729,25 +829,32 @@ router.get('/chats', auth_1.authenticateToken, async (req, res) => {
         created_at DESC`, [currentUserId]);
         const lastMessagesMap = new Map(lastMessagesResult.rows.map((r) => [r.partner_id, r]));
         // Query 3: Get unread counts (using partial index - no GROUP BY needed)
+        // IMPORTANT: Only count messages where currentUserId is the RECIPIENT (not sender)
         // Use Redis if available, otherwise fallback to DB
         const { getAllUnreadCounts } = await Promise.resolve().then(() => __importStar(require('../redis')));
         let unreadCountsMap;
         try {
+            // getAllUnreadCounts returns Map<senderId, count> for messages received by currentUserId
             unreadCountsMap = await getAllUnreadCounts(currentUserId);
+            console.log(`Unread counts for user ${currentUserId}:`, Array.from(unreadCountsMap.entries()));
         }
         catch {
             // Fallback: single query with partial index (faster than GROUP BY)
+            // Only count messages where currentUserId is the recipient
             const unreadResult = await db_1.pool.query(`SELECT sender_id, COUNT(*) as unread_count
         FROM messages
         WHERE recipient_id = $1 AND status != 'read'
         GROUP BY sender_id`, [currentUserId]);
             unreadCountsMap = new Map(unreadResult.rows.map((r) => [r.sender_id, parseInt(r.unread_count, 10)]));
+            console.log(`Unread counts from DB for user ${currentUserId}:`, Array.from(unreadCountsMap.entries()));
         }
-        // Query 4: Get user details (single query with IN clause)
-        const usersResult = await db_1.pool.query(`SELECT id, display_name, username
+        // Query 4: Get user details including profile pictures (single query with IN clause)
+        const usersResult = await db_1.pool.query(`SELECT id, display_name, username, profile_picture
       FROM users
       WHERE id = ANY($1::uuid[]) AND is_active = TRUE`, [partnerIds]);
         const usersMap = new Map(usersResult.rows.map((u) => [u.id, u]));
+        // Get base URL for constructing full profile picture URLs
+        const baseUrl = process.env.API_BASE_URL || 'http://localhost:4000';
         // Combine results
         const chats = partnerIds
             .map((partnerId) => {
@@ -755,12 +862,25 @@ router.get('/chats', auth_1.authenticateToken, async (req, res) => {
             if (!user)
                 return null;
             const lastMessage = lastMessagesMap.get(partnerId);
+            // unreadCountsMap contains { senderId: count } where senderId sent messages TO currentUserId
+            // So for a chat with partnerId, we look up how many unread messages partnerId sent to currentUserId
+            // This should ONLY be > 0 if partnerId sent messages to currentUserId (currentUserId is the recipient)
             const unreadCount = unreadCountsMap.get(partnerId) || 0;
+            // Debug: Log unread count for this chat
+            if (unreadCount > 0) {
+                console.log(`[ChatList] User ${currentUserId} has ${unreadCount} unread messages from ${partnerId} (${user.display_name || user.username})`);
+            }
+            // Get full URL for profile picture
+            let profilePictureUrl = user.profile_picture ?? null;
+            if (profilePictureUrl && !profilePictureUrl.startsWith('http')) {
+                // If it's a local path, construct full URL
+                profilePictureUrl = `${baseUrl}${profilePictureUrl}`;
+            }
             return {
                 id: user.id,
                 userId: user.id,
                 userName: user.display_name || user.username || 'Unknown',
-                userAvatar: null,
+                userAvatar: profilePictureUrl,
                 lastMessage: lastMessage?.content || null,
                 lastMessageTime: lastMessage?.created_at || null,
                 lastMessageStatus: lastMessage?.sender_id === currentUserId ? lastMessage?.status : undefined,
@@ -1251,6 +1371,240 @@ router.post('/:id/unpin', auth_1.authenticateToken, async (req, res) => {
     }
     catch (err) {
         console.error('Unpin message error', err);
+        return res.status(500).json({ message: 'Internal server error' });
+    }
+});
+/**
+ * DELETE /messages/:messageId
+ * Delete a message (for me only - soft delete)
+ */
+router.delete('/:messageId', auth_1.authenticateToken, async (req, res) => {
+    try {
+        const currentUserId = req.user.id;
+        const messageId = req.params.messageId;
+        // Check if message exists and user has access
+        const { rows: messageRows } = await db_1.pool.query(`SELECT id, sender_id, recipient_id 
+       FROM messages 
+       WHERE id = $1 AND (sender_id = $2 OR recipient_id = $2)`, [messageId, currentUserId]);
+        if (messageRows.length === 0) {
+            return res.status(404).json({ message: 'Message not found' });
+        }
+        const message = messageRows[0];
+        // Ensure deleted_messages table exists for soft delete tracking
+        await db_1.pool.query(`
+      CREATE TABLE IF NOT EXISTS deleted_messages (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        message_id UUID NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
+        user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        deleted_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        UNIQUE (message_id, user_id)
+      )
+    `).catch(() => {
+            // Table might already exist
+        });
+        // Soft delete: Mark message as deleted for this user
+        await db_1.pool.query(`INSERT INTO deleted_messages (message_id, user_id)
+       VALUES ($1, $2)
+       ON CONFLICT (message_id, user_id) DO NOTHING`, [messageId, currentUserId]);
+        // Notify the other user via WebSocket
+        const otherUserId = message.sender_id === currentUserId
+            ? message.recipient_id
+            : message.sender_id;
+        const { getIoInstance } = await Promise.resolve().then(() => __importStar(require('../socket')));
+        const io = getIoInstance();
+        if (io) {
+            io.to(`user:${otherUserId}`).emit('message:deleted', {
+                messageId,
+                deletedBy: currentUserId,
+            });
+        }
+        return res.json({ success: true, deleted: true });
+    }
+    catch (err) {
+        console.error('Delete message error', err);
+        return res.status(500).json({ message: 'Internal server error' });
+    }
+});
+/**
+ * DELETE /messages/:messageId/for-everyone
+ * Delete a message for everyone (hard delete - only if sender and within time limit)
+ */
+router.delete('/:messageId/for-everyone', auth_1.authenticateToken, async (req, res) => {
+    try {
+        const currentUserId = req.user.id;
+        const messageId = req.params.messageId;
+        // Check if message exists and user is the sender
+        const { rows: messageRows } = await db_1.pool.query(`SELECT id, sender_id, recipient_id, created_at 
+       FROM messages 
+       WHERE id = $1 AND sender_id = $2`, [messageId, currentUserId]);
+        if (messageRows.length === 0) {
+            return res.status(404).json({ message: 'Message not found or you are not the sender' });
+        }
+        const message = messageRows[0];
+        const messageAge = Date.now() - new Date(message.created_at).getTime();
+        const fifteenMinutes = 15 * 60 * 1000;
+        // Only allow delete for everyone within 15 minutes (WhatsApp pattern)
+        if (messageAge > fifteenMinutes) {
+            return res.status(403).json({
+                message: 'Cannot delete message for everyone after 15 minutes'
+            });
+        }
+        // Hard delete: Remove message from database
+        await db_1.pool.query(`DELETE FROM messages WHERE id = $1`, [messageId]);
+        // Notify the recipient via WebSocket
+        const { getIoInstance } = await Promise.resolve().then(() => __importStar(require('../socket')));
+        const io = getIoInstance();
+        if (io) {
+            io.to(`user:${message.recipient_id}`).emit('message:deleted', {
+                messageId,
+                deletedBy: currentUserId,
+                deletedForEveryone: true,
+            });
+        }
+        return res.json({ success: true, deleted: true, deletedForEveryone: true });
+    }
+    catch (err) {
+        console.error('Delete message for everyone error', err);
+        return res.status(500).json({ message: 'Internal server error' });
+    }
+});
+/**
+ * POST /messages/batch-delete
+ * Delete multiple messages at once
+ */
+router.post('/batch-delete', auth_1.authenticateToken, async (req, res) => {
+    try {
+        const currentUserId = req.user.id;
+        const { messageIds, deleteForEveryone } = req.body;
+        if (!Array.isArray(messageIds) || messageIds.length === 0) {
+            return res.status(400).json({ message: 'Message IDs array is required' });
+        }
+        if (deleteForEveryone) {
+            // Delete for everyone: Only if user is sender and within 15 minutes
+            const { rows: messages } = await db_1.pool.query(`SELECT id, sender_id, recipient_id, created_at 
+         FROM messages 
+         WHERE id = ANY($1::uuid[]) AND sender_id = $2`, [messageIds, currentUserId]);
+            const now = Date.now();
+            const fifteenMinutes = 15 * 60 * 1000;
+            const deletableMessages = messages.filter((m) => now - new Date(m.created_at).getTime() <= fifteenMinutes);
+            if (deletableMessages.length === 0) {
+                return res.status(403).json({
+                    message: 'No messages can be deleted for everyone (time limit exceeded or not sender)'
+                });
+            }
+            const deletableIds = deletableMessages.map((m) => m.id);
+            await db_1.pool.query(`DELETE FROM messages WHERE id = ANY($1::uuid[])`, [deletableIds]);
+            // Notify recipients
+            const recipients = new Set(deletableMessages.map((m) => m.recipient_id));
+            const { getIoInstance } = await Promise.resolve().then(() => __importStar(require('../socket')));
+            const io = getIoInstance();
+            if (io) {
+                recipients.forEach((recipientId) => {
+                    io.to(`user:${recipientId}`).emit('message:deleted', {
+                        messageIds: deletableIds,
+                        deletedBy: currentUserId,
+                        deletedForEveryone: true,
+                    });
+                });
+            }
+            return res.json({
+                success: true,
+                deleted: deletableIds.length,
+                total: messageIds.length
+            });
+        }
+        else {
+            // Delete for me: Soft delete
+            await db_1.pool.query(`
+        CREATE TABLE IF NOT EXISTS deleted_messages (
+          id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+          message_id UUID NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
+          user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+          deleted_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+          UNIQUE (message_id, user_id)
+        )
+      `).catch(() => {
+                // Table might already exist
+            });
+            // Batch insert deleted messages
+            const values = messageIds.map((id, index) => `($${index * 2 + 1}::uuid, $${index * 2 + 2}::uuid)`).join(', ');
+            const params = messageIds.flatMap((id) => [id, currentUserId]);
+            await db_1.pool.query(`INSERT INTO deleted_messages (message_id, user_id)
+         VALUES ${values}
+         ON CONFLICT (message_id, user_id) DO NOTHING`, params);
+            return res.json({ success: true, deleted: messageIds.length });
+        }
+    }
+    catch (err) {
+        console.error('Batch delete error', err);
+        return res.status(500).json({ message: 'Internal server error' });
+    }
+});
+/**
+ * GET /messages/pin/:userId
+ * Check if conversation is pinned
+ */
+router.get('/pin/:userId', auth_1.authenticateToken, async (req, res) => {
+    try {
+        const currentUserId = req.user.id;
+        const otherUserId = req.params.userId;
+        await db_1.pool.query(`
+      CREATE TABLE IF NOT EXISTS pinned_chats (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        chat_user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        pinned_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        UNIQUE (user_id, chat_user_id)
+      )
+    `).catch(() => { });
+        const { rows } = await db_1.pool.query(`SELECT 1 FROM pinned_chats WHERE user_id = $1 AND chat_user_id = $2`, [currentUserId, otherUserId]);
+        return res.json({ pinned: rows.length > 0 });
+    }
+    catch (err) {
+        console.error('Check pin status error', err);
+        return res.json({ pinned: false });
+    }
+});
+/**
+ * POST /messages/pin/:userId
+ * Pin a conversation
+ */
+router.post('/pin/:userId', auth_1.authenticateToken, async (req, res) => {
+    try {
+        const currentUserId = req.user.id;
+        const otherUserId = req.params.userId;
+        await db_1.pool.query(`
+      CREATE TABLE IF NOT EXISTS pinned_chats (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        chat_user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        pinned_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        UNIQUE (user_id, chat_user_id)
+      )
+    `).catch(() => { });
+        await db_1.pool.query(`INSERT INTO pinned_chats (user_id, chat_user_id)
+       VALUES ($1, $2)
+       ON CONFLICT (user_id, chat_user_id) DO NOTHING`, [currentUserId, otherUserId]);
+        return res.json({ success: true });
+    }
+    catch (err) {
+        console.error('Pin chat error', err);
+        return res.status(500).json({ message: 'Internal server error' });
+    }
+});
+/**
+ * DELETE /messages/pin/:userId
+ * Unpin a conversation
+ */
+router.delete('/pin/:userId', auth_1.authenticateToken, async (req, res) => {
+    try {
+        const currentUserId = req.user.id;
+        const otherUserId = req.params.userId;
+        await db_1.pool.query(`DELETE FROM pinned_chats WHERE user_id = $1 AND chat_user_id = $2`, [currentUserId, otherUserId]);
+        return res.json({ success: true });
+    }
+    catch (err) {
+        console.error('Unpin chat error', err);
         return res.status(500).json({ message: 'Internal server error' });
     }
 });
