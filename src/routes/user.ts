@@ -800,6 +800,191 @@ router.put('/me/chat-rate', authenticateToken, async (req: Request, res: Respons
 });
 
 /**
+ * GET /user/me/call-rate - Get current user's call rate configuration
+ */
+router.get('/me/call-rate', authenticateToken, async (req: Request, res: Response) => {
+  try {
+    const userId = req.user!.id;
+
+    const { rows } = await pool.query(
+      `SELECT 
+        COALESCE(voice_call_rate_per_second, 3)::numeric as voice_rate_per_second,
+        COALESCE(video_call_rate_per_second, 5)::numeric as video_rate_per_second,
+        COALESCE(call_rate_charging_enabled, TRUE) as rate_charging_enabled,
+        COALESCE(call_minimum_duration_seconds, 60)::int as minimum_duration_seconds,
+        COALESCE(call_auto_end_inactivity, TRUE) as auto_end_inactivity,
+        COALESCE(call_inactivity_timeout_minutes, 10)::int as inactivity_timeout_minutes,
+        COALESCE(call_require_pre_payment, TRUE) as require_pre_payment,
+        COALESCE(call_minimum_balance_required, 1000)::numeric as minimum_balance_required,
+        COALESCE(call_category, 'general') as call_category,
+        COALESCE(call_enable_video_rates, TRUE) as enable_video_rates
+       FROM users
+       WHERE id = $1`,
+      [userId],
+    );
+
+    if (rows.length === 0) {
+      return res.status(404).json({ message: 'User not found' });
+    }
+
+    const user = rows[0];
+    return res.json({
+      voiceRatePerSecond: Number(user.voice_rate_per_second) ?? 3,
+      videoRatePerSecond: Number(user.video_rate_per_second) ?? 5,
+      enableCallRateCharging: user.rate_charging_enabled ?? true,
+      minimumCallDuration: user.minimum_duration_seconds ?? 60,
+      autoEndAfterInactivity: user.auto_end_inactivity ?? true,
+      inactivityTimeout: user.inactivity_timeout_minutes ?? 10,
+      requirePrePayment: user.require_pre_payment ?? true,
+      minimumBalance: Number(user.minimum_balance_required) ?? 1000,
+      callCategory: user.call_category ?? 'general',
+      enableVideoRates: user.enable_video_rates ?? true,
+    });
+  } catch (err) {
+    console.error('Get call rate config error', err);
+    return res.status(500).json({ message: 'Internal server error' });
+  }
+});
+
+/**
+ * PUT /user/me/call-rate - Update call rate configuration
+ */
+router.put('/me/call-rate', authenticateToken, async (req: Request, res: Response) => {
+  try {
+    const userId = req.user!.id;
+    const {
+      voiceRatePerSecond,
+      videoRatePerSecond,
+      enableCallRateCharging,
+      minimumCallDuration,
+      autoEndAfterInactivity,
+      inactivityTimeout,
+      requirePrePayment,
+      minimumBalance,
+      callCategory,
+      enableVideoRates,
+    } = req.body;
+
+    // Validate voiceRatePerSecond
+    const voiceRate = voiceRatePerSecond != null ? Number(voiceRatePerSecond) : null;
+    if (voiceRate != null && (isNaN(voiceRate) || voiceRate < 0)) {
+      return res.status(400).json({ message: 'Voice rate per second must be a non-negative number' });
+    }
+
+    // Validate videoRatePerSecond
+    const videoRate = videoRatePerSecond != null ? Number(videoRatePerSecond) : null;
+    if (videoRate != null && (isNaN(videoRate) || videoRate < 0)) {
+      return res.status(400).json({ message: 'Video rate per second must be a non-negative number' });
+    }
+
+    // Validate minimumCallDuration
+    const minDuration = minimumCallDuration != null ? Number(minimumCallDuration) : null;
+    if (minDuration != null && (isNaN(minDuration) || minDuration < 1)) {
+      return res.status(400).json({ message: 'Minimum call duration must be at least 1 second' });
+    }
+
+    // Validate inactivityTimeout
+    const timeout = inactivityTimeout != null ? Number(inactivityTimeout) : null;
+    if (timeout != null && (isNaN(timeout) || timeout < 1 || timeout > 60)) {
+      return res.status(400).json({ message: 'Inactivity timeout must be between 1 and 60 minutes' });
+    }
+
+    // Validate minimumBalance
+    const minBalance = minimumBalance != null ? Number(minimumBalance) : null;
+    if (minBalance != null && (isNaN(minBalance) || minBalance < 0)) {
+      return res.status(400).json({ message: 'Minimum balance must be a non-negative number' });
+    }
+
+    // Validate callCategory
+    const validCategories = ['general', 'consultation', 'coaching', 'business', 'technical', 'creative', 'tutoring'];
+    if (callCategory && !validCategories.includes(callCategory)) {
+      return res.status(400).json({ message: `Call category must be one of: ${validCategories.join(', ')}` });
+    }
+
+    const updateFields: string[] = [];
+    const updateValues: any[] = [];
+    let paramIndex = 1;
+
+    if (voiceRate != null) {
+      updateFields.push(`voice_call_rate_per_second = $${paramIndex}`);
+      updateValues.push(voiceRate);
+      paramIndex++;
+    }
+
+    if (videoRate != null) {
+      updateFields.push(`video_call_rate_per_second = $${paramIndex}`);
+      updateValues.push(videoRate);
+      paramIndex++;
+    }
+
+    if (typeof enableCallRateCharging === 'boolean') {
+      updateFields.push(`call_rate_charging_enabled = $${paramIndex}`);
+      updateValues.push(enableCallRateCharging);
+      paramIndex++;
+    }
+
+    if (minDuration != null) {
+      updateFields.push(`call_minimum_duration_seconds = $${paramIndex}`);
+      updateValues.push(minDuration);
+      paramIndex++;
+    }
+
+    if (typeof autoEndAfterInactivity === 'boolean') {
+      updateFields.push(`call_auto_end_inactivity = $${paramIndex}`);
+      updateValues.push(autoEndAfterInactivity);
+      paramIndex++;
+    }
+
+    if (timeout != null) {
+      updateFields.push(`call_inactivity_timeout_minutes = $${paramIndex}`);
+      updateValues.push(timeout);
+      paramIndex++;
+    }
+
+    if (typeof requirePrePayment === 'boolean') {
+      updateFields.push(`call_require_pre_payment = $${paramIndex}`);
+      updateValues.push(requirePrePayment);
+      paramIndex++;
+    }
+
+    if (minBalance != null) {
+      updateFields.push(`call_minimum_balance_required = $${paramIndex}`);
+      updateValues.push(minBalance);
+      paramIndex++;
+    }
+
+    if (callCategory) {
+      updateFields.push(`call_category = $${paramIndex}`);
+      updateValues.push(callCategory);
+      paramIndex++;
+    }
+
+    if (typeof enableVideoRates === 'boolean') {
+      updateFields.push(`call_enable_video_rates = $${paramIndex}`);
+      updateValues.push(enableVideoRates);
+      paramIndex++;
+    }
+
+    if (updateFields.length === 0) {
+      return res.status(400).json({ message: 'No fields to update' });
+    }
+
+    updateValues.push(userId);
+    const query = `UPDATE users SET ${updateFields.join(', ')} WHERE id = $${paramIndex}`;
+
+    await pool.query(query, updateValues);
+
+    return res.json({
+      success: true,
+      message: 'Call rate configuration updated successfully',
+    });
+  } catch (err) {
+    console.error('Update call rate config error', err);
+    return res.status(500).json({ message: 'Internal server error' });
+  }
+});
+
+/**
  * POST /user/me/profile-picture
  * Upload profile picture (display picture)
  */
