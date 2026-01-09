@@ -17,3 +17,4 @@ ADD COLUMN IF NOT EXISTS call_enable_video_rates BOOLEAN NOT NULL DEFAULT TRUE;
 CREATE INDEX IF NOT EXISTS idx_users_call_category ON users(call_category) WHERE call_category IS NOT NULL;
 
 
+
